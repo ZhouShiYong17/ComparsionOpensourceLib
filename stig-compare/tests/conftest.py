@@ -3,3 +3,6 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
+
+TESTS = Path(__file__).resolve().parent
+sys.path.insert(0, str(TESTS))

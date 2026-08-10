@@ -134,6 +134,26 @@ def _write_real_docx(path):
     d.save(str(path))
 
 
+def _write_merged_docx(path):
+    """Write a docx with a heading and a table with merged cells in the second data row."""
+    d = docx.Document()
+    d.add_paragraph("Merged Example")
+    headers = ["A", "B"]
+    t = d.add_table(rows=1, cols=len(headers))
+    for i, h in enumerate(headers):
+        t.rows[0].cells[i].text = h
+    # First data row (no merge)
+    cells = t.add_row().cells
+    cells[0].text = "Cell A1"
+    cells[1].text = "Cell B1"
+    # Second data row (merged)
+    cells = t.add_row().cells
+    cells[0].text = "Merged A2"
+    cells[1].text = "Merged B2"
+    cells[0].merge(cells[1])
+    d.save(str(path))
+
+
 def build_all(out_dir):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -184,5 +204,8 @@ def build_all(out_dir):
 
     paths["company_real_docx"] = out / "company_real.docx"
     _write_real_docx(paths["company_real_docx"])
+
+    paths["company_merged_docx"] = out / "company_merged.docx"
+    _write_merged_docx(paths["company_merged_docx"])
 
     return paths

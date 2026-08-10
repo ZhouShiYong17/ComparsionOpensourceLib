@@ -14,6 +14,7 @@ def test_all_fixtures_exist(fixture_files):
     expected = {
         "official_csv", "official_json", "official_xlsx", "official_dup_ids_csv",
         "company_docx", "company_docx_messy", "company_xlsx", "company_real_docx",
+        "company_merged_docx",
     }
     assert expected == set(fixture_files)
     for path in fixture_files.values():

@@ -41,3 +41,10 @@ def test_unsupported_suffix_raises(paths, tmp_path):
     bad.write_text("hi", encoding="utf-8")
     with pytest.raises(ValueError):
         skeleton.extract_skeleton(bad)
+
+
+def test_merged_cells_flagged(paths):
+    skel = skeleton.extract_skeleton(paths["company_merged_docx"])
+    rows = skel["tables"][0]["rows"]
+    assert rows[0]["merged"] is False
+    assert rows[1]["merged"] is True

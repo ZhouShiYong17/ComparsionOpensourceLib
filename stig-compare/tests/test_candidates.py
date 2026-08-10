@@ -67,3 +67,22 @@ def test_severity_alone_never_creates_candidate(data):
            "original_company_text": "High"}
     results = candidates.generate([row], official)
     assert results[0]["candidates"] == []
+
+
+def test_paraphrased_row_with_token_overlap_only(data):
+    # Regression: paraphrased row using only ordinary words (no technical tokens,
+    # no value overlap, non-matching severity) must still appear in shortlist.
+    # This tests the recall mechanism that stopword filtering must preserve.
+    official, _ = data
+    row = {"row_id": "R-test0002", "status": "ok", "context_grouping": "High",
+           "stig_description": "User sessions should terminate after idle time",
+           "stig_objective_or_requirement": "User sessions must end after a short period of inactivity",
+           "stig_command_or_value": "Check session timeout settings",
+           "company_approved_setting_or_expected_value": "",
+           "observed_value_or_evidence": "",
+           "original_company_text": "User sessions must end after a short period of inactivity"}
+    results = candidates.generate([row], official)
+    # V-1004 is "Session timeout must be enforced" (severity medium)
+    # Should appear in shortlist via token overlap despite context mismatch
+    ids = [c["rule_id"] for c in results[0]["candidates"]]
+    assert "V-1004" in ids

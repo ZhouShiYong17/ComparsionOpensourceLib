@@ -1,6 +1,9 @@
 """Lexical candidate generation and deterministic match tiers T0/T1.
 
 Explainable features only; severity can only break ties (spec section 4.5-4.6).
+Stopwords (common function words and instruction verbs) are excluded from
+token-frequency scoring to prevent false positives from shared boilerplate.
+Severity-only candidates are dropped: score must exceed severity contribution.
 """
 import math
 import re
@@ -12,6 +15,15 @@ _TECH = re.compile(
     r"[A-Za-z0-9_.\\/-]*(?:_[A-Za-z0-9]+|\.[A-Za-z]+\.[A-Za-z.]+|\\[A-Za-z])"
     r"[A-Za-z0-9_.\\/-]*")
 _WORD = re.compile(r"[a-z0-9_]+")
+
+# Common function words and instruction verbs excluded from token scoring
+# to prevent IDF dominance in small corpora (e.g., "show" alone matching
+# unrelated rows that happen to mention "show a logo" vs "SHOW PARAMETER")
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "to", "of", "in", "for", "is", "are", "be",
+    "must", "should", "run", "show", "set", "verify", "check", "ensure",
+    "with", "on", "all"
+}
 
 _WEIGHTS = {"technical": 3.0, "token_overlap": 1.0,
             "value_overlap": 0.3, "severity_tiebreak": 0.05}
@@ -32,7 +44,8 @@ def technical_tokens(text):
 
 
 def _words(text):
-    return set(_WORD.findall(normalize.norm_text(text)))
+    raw = set(_WORD.findall(normalize.norm_text(text)))
+    return raw - _STOPWORDS
 
 
 def build_idf(official_rules):
@@ -95,14 +108,11 @@ def generate(company_rows, official_rules, k=5, floor=0.05, margin=0.15):
              for r in official_rules),
             key=lambda c: c["score"], reverse=True)
         # severity alone must never clear the floor: drop candidates whose
-        # score comes only from the severity feature. similarly, token_overlap
-        # alone (no technical/value/severity match) doesn't make a plausible candidate.
+        # score comes only from the severity feature
         shortlist = [c for c in scored
                      if c["score"] >= floor and
                      c["score"] > _WEIGHTS["severity_tiebreak"] *
-                     c["features"]["severity_tiebreak"] + 1e-9 and
-                     c["score"] > _WEIGHTS["token_overlap"] *
-                     c["features"]["token_overlap"] + 1e-9][:k]
+                     c["features"]["severity_tiebreak"] + 1e-9][:k]
 
         result = {"row_id": row["row_id"], "tier": None,
                   "matched_rule_id": None, "margin_flag": False,

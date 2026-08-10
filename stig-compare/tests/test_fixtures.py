@@ -13,7 +13,7 @@ def fixture_files(tmp_path_factory):
 def test_all_fixtures_exist(fixture_files):
     expected = {
         "official_csv", "official_json", "official_xlsx", "official_dup_ids_csv",
-        "company_docx", "company_docx_messy", "company_xlsx",
+        "company_docx", "company_docx_messy", "company_xlsx", "company_real_docx",
     }
     assert expected == set(fixture_files)
     for path in fixture_files.values():
@@ -32,3 +32,18 @@ def test_company_docx_table_shape(fixture_files):
     table = d.tables[0]
     assert len(table.rows) == 5          # header + 4 data rows
     assert table.rows[0].cells[0].text == "Group"
+
+
+def test_company_real_docx_built(tmp_path):
+    import docx as docx_lib
+    from fixtures import build_fixtures
+
+    paths = build_fixtures.build_all(tmp_path)
+    p = paths["company_real_docx"]
+    d = docx_lib.Document(str(p))
+    assert len(d.tables) == 4
+    texts = [para.text for para in d.paragraphs if para.text.strip()]
+    assert "JB.1.1 STIG HARDEING- SEVERITY HIGH" in texts
+    assert "IM-1.1 Settings related to Policy or Standards" in texts
+    ex2 = d.tables[3]
+    assert len(ex2.rows[0].cells) == len(build_fixtures.EX2_HEADERS)

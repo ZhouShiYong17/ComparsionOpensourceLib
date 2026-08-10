@@ -607,6 +607,54 @@ def cmd_resolve(args):
                     records_by_id[m["record_id"]], m, rules_by_id))
     match_state = list(state_by_id.values())
 
+    # ---- sweep-response pass ----------------------------------------------
+    consumed_sweep = set(consumed["sweep"])
+    sweep_reqs = _read_jsonl_opt(run_dir / "sweep_requests.jsonl")
+    sweep_req_by_id = {r["sweep_id"]: r for r in sweep_reqs}
+    sweep_injected = {}
+    for raw_line in _read_response_lines(run_dir / "sweep_responses.jsonl"):
+        fp = _fingerprint(raw_line)
+        if fp in consumed_sweep:
+            continue
+        consumed_sweep.add(fp)
+        resp, parse_err = _parse_response_line(raw_line)
+        if parse_err:
+            validation_failures_new.append(
+                _mk_failure(None, "sweep", [parse_err], raw_line))
+            continue
+        sid = resp.get("sweep_id")
+        req = sweep_req_by_id.get(sid) if isinstance(sid, str) else None
+        if req is None:
+            validation_failures_new.append(
+                _mk_failure(None, "sweep", ["no-such-request"], resp))
+            continue
+        batch_ids = {r["record_id"] for r in req["records"]}
+        index_ids = {r["rule_id"] for r in req["rules_index"]}
+        errs = validate.validate_sweep_output(resp, batch_ids, index_ids)
+        if errs:
+            validation_failures_new.append(
+                _mk_failure(None, "sweep", errs, resp))
+            continue
+        for p in resp["proposals"]:
+            m = state_by_id.get(p["record_id"])
+            if m is None or m["tier"] not in (None, "T4"):
+                continue
+            if not any(c["rule_id"] == p["rule_id"]
+                       for c in m["candidates"]):
+                m["candidates"].append({"rule_id": p["rule_id"],
+                                        "score": 0.0,
+                                        "features": {"sweep": 1.0}})
+            if p["rule_id"] not in m["sweep_origin_rule_ids"]:
+                m["sweep_origin_rule_ids"].append(p["rule_id"])
+            m["tier"] = None
+            m["match_failures"] = 0
+            sweep_injected[p["record_id"]] = m
+    for rid, m in sweep_injected.items():
+        new_matching_requests.append(_matching_request(
+            records_by_id[rid], m, rules_by_id,
+            extra={"sweep_round": True}))
+    consumed["sweep"] = sorted(consumed_sweep)
+
     # ---- matching pass -----------------------------------------------------
     requested_ids = {r["record_id"] for r in matching_requests_all}
     matching_ok = 0
@@ -730,6 +778,62 @@ def cmd_resolve(args):
           f"matching_rejected_final={matching_rejected_final} "
           f"no_such_request={no_such_request} retries_pending={retries_pending} "
           f"new_findings={len(new_findings)} semantic_pending={semantic_pending_total}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# sweep
+# --------------------------------------------------------------------------
+
+def cmd_sweep(args):
+    run_dir = Path(args.run_dir)
+    state_path = run_dir / "sweep_state.json"
+    if state_path.exists():
+        print("sweep: already-done")
+        return 0
+    company_records = _read_jsonl_opt(run_dir / "company_records.jsonl")
+    records_by_id = {r["record_id"]: r for r in company_records}
+    official_rules = common.read_jsonl(run_dir / "official_rules.jsonl")
+    match_state = [_ensure_match_fields(m) for m in
+                   _read_jsonl_opt(run_dir / "match_state.jsonl")]
+
+    matched_ids = set()
+    for m in match_state:
+        if m["tier"] in _MATCHED_TIERS:
+            matched_ids.update(m["matched_rule_ids"])
+    unmatched = [records_by_id[m["record_id"]] for m in match_state
+                 if m["tier"] in (None, "T4")
+                 and records_by_id.get(m["record_id"], {}).get("status") == "ok"]
+    unaddressed = [r for r in official_rules
+                   if r["rule_id"] not in matched_ids]
+    if not unmatched or not unaddressed:
+        state_path.write_text(json.dumps({"done": True, "batches": 0},
+                                         indent=1), encoding="utf-8")
+        print("sweep: nothing-to-sweep")
+        return 0
+
+    index = [{"rule_id": r["rule_id"], "title": r.get("title", ""),
+              "expected_value": r.get("expected_value", ""),
+              "tech_tokens": sorted(candidates_mod.technical_tokens(
+                  _rule_text(r)))[:8]}
+             for r in unaddressed]
+    requests = []
+    for bi, start in enumerate(range(0, len(unmatched), 20)):
+        batch = unmatched[start:start + 20]
+        requests.append({
+            "sweep_id": f"S{bi}",
+            "records": [{"record_id": r["record_id"],
+                         "context_grouping": r["context_grouping"],
+                         **{f: r[f] for f in canonical.CANONICAL_DATA_FIELDS}}
+                        for r in batch],
+            "rules_index": index,
+            "instructions_file": "prompts/sweep.md"})
+    common.write_jsonl(run_dir / "sweep_requests.jsonl", requests)
+    state_path.write_text(json.dumps({"done": True,
+                                      "batches": len(requests)}, indent=1),
+                          encoding="utf-8")
+    print(f"sweep: batches={len(requests)} unmatched={len(unmatched)} "
+          f"unaddressed={len(unaddressed)}")
     return 0
 
 
@@ -1153,6 +1257,9 @@ def main(argv=None):
     p_resolve = sub.add_parser("resolve")
     p_resolve.add_argument("--run-dir", required=True)
 
+    p_sweep = sub.add_parser("sweep")
+    p_sweep.add_argument("--run-dir", required=True)
+
     p_finalize = sub.add_parser("finalize")
     p_finalize.add_argument("--run-dir", required=True)
     p_finalize.add_argument("--no-report", action="store_true")
@@ -1163,6 +1270,8 @@ def main(argv=None):
         return cmd_start(args)
     if args.cmd == "resolve":
         return cmd_resolve(args)
+    if args.cmd == "sweep":
+        return cmd_sweep(args)
     if args.cmd == "finalize":
         return cmd_finalize(args)
     raise ValueError(f"unknown command: {args.cmd}")

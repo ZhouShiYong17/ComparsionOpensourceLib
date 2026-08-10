@@ -805,3 +805,55 @@ def test_multi_select_match_produces_pair_findings(tmp_path, fixture_paths):
     assert covered == set(m0["matched_rule_ids"])
     for f in findings:
         assert "record_id" in f and "row_id" in f
+
+
+# --------------------------------------------------------------------------
+# Task 13: sweep command and sweep-response processing
+# --------------------------------------------------------------------------
+
+def _finish_matching_as_none(run_dir):
+    m_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    answers = [_match_answer(r, []) for r in m_reqs]
+    common.write_jsonl(run_dir / "matching_responses.jsonl", answers)
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+
+def test_sweep_generates_requests_then_injects(tmp_path, fixture_paths):
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    _answer_extraction(run_dir)
+    _finish_matching_as_none(run_dir)
+
+    assert pipeline.main(["sweep", "--run-dir", str(run_dir)]) == 0
+    s_reqs = common.read_jsonl(run_dir / "sweep_requests.jsonl")
+    assert s_reqs and s_reqs[0]["sweep_id"] == "S0"
+    assert all(len(b["records"]) <= 20 for b in s_reqs)
+    assert {"rule_id", "title", "expected_value", "tech_tokens"} <= \
+        set(s_reqs[0]["rules_index"][0])
+
+    # second invocation is a no-op
+    assert pipeline.main(["sweep", "--run-dir", str(run_dir)]) == 0
+    assert common.read_jsonl(run_dir / "sweep_requests.jsonl") == s_reqs
+
+    batch = s_reqs[0]
+    rec_id = batch["records"][0]["record_id"]
+    rule_id = batch["rules_index"][0]["rule_id"]
+    common.write_jsonl(run_dir / "sweep_responses.jsonl",
+                       [{"sweep_id": batch["sweep_id"],
+                         "proposals": [{"record_id": rec_id,
+                                        "rule_id": rule_id}]}])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+    state = {m["record_id"]: m
+             for m in common.read_jsonl(run_dir / "match_state.jsonl")}
+    m = state[rec_id]
+    assert m["tier"] is None
+    assert rule_id in m["sweep_origin_rule_ids"]
+    assert any(c["rule_id"] == rule_id for c in m["candidates"])
+    reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    assert any(r.get("sweep_round") and r["record_id"] == rec_id
+               for r in reqs)

@@ -15,9 +15,9 @@ STRICT RULES — apply to every response:
 
 One record from `semantic_requests.jsonl`:
 
-- `row_id` (string) — echo back unchanged.
+- `record_id` (string) — echo back unchanged.
 - `rule_id` (string) — echo back unchanged.
-- `row` (object) — the full company row already matched to this rule,
+- `record` (object) — the full company record already matched to this rule,
   including `original_company_text`, the structured fields, and
   `observed_value_or_evidence`.
 - `rule` (object) — the full official rule: `rule_id`, `title`,
@@ -30,7 +30,7 @@ One record from `semantic_requests.jsonl`:
 
 ```json
 {
-  "row_id": "...",
+  "record_id": "...",
   "rule_id": "...",
   "finding_type": "equivalent | stronger | weaker | changed-scope | contradictory | cannot-determine",
   "verdict": "Compliant | Non-Compliant | Cannot Assess",
@@ -40,29 +40,29 @@ One record from `semantic_requests.jsonl`:
 }
 ```
 
-`row_id` and `rule_id` must exactly echo the request's values.
+`record_id` and `rule_id` must exactly echo the request's values.
 
 ## Decision guide
 
-- `verdict: "Compliant"` ONLY when the row's evidence demonstrably
+- `verdict: "Compliant"` ONLY when the record's evidence demonstrably
   satisfies the official `expected_value`/`check_text` — the evidence must
-  actually be present in the row's text and leave no real doubt.
-- If the row's evidence is missing, vague, or does not directly address
+  actually be present in the record's text and leave no real doubt.
+- If the record's evidence is missing, vague, or does not directly address
   what the rule requires, use `verdict: "Cannot Assess"`. Never guess
   compliance from silence or ambiguity.
-- If the row's evidence directly contradicts what the rule requires, use
+- If the record's evidence directly contradicts what the rule requires, use
   `finding_type: "contradictory"`.
 - `finding_type` must be exactly one of: `equivalent`, `stronger`,
   `weaker`, `changed-scope`, `contradictory`, `cannot-determine` — pick
-  the one word that best describes how the row's requirement compares to
+  the one word that best describes how the record's requirement compares to
   the rule's requirement.
-- `row_quote` must be copied verbatim from `row`'s text; `rule_quote` must
+- `row_quote` must be copied verbatim from `record`'s text; `rule_quote` must
   be copied verbatim from `rule`'s `title`/`check_text`/`fix_text`. Both
   are observation only — no reasoning inside a quote.
 - `row_quote` and `rule_quote` must NEVER be empty, in every response you
   send, with no exception for `"Cannot Assess"` or `"cannot-determine"`.
-  If the row's evidence is missing or unclear, still quote the nearest
-  relevant fragment — e.g. the row field text that fails to supply the
+  If the record's evidence is missing or unclear, still quote the nearest
+  relevant fragment — e.g. the record field text that fails to supply the
   needed evidence, and the rule's `expected_value`/`check_text` fragment
   it fails to satisfy. An empty quote is rejected unconditionally; `""`
   is never a valid answer here (unlike the structuring prompt's fields).

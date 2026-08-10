@@ -3,8 +3,8 @@ from pathlib import Path
 import common
 
 PKG = Path(__file__).resolve().parent.parent
-PROMPTS = ["structuring.md", "matching.md", "semantic_compare.md",
-           "validator.md"]
+PROMPTS = ["table_mapping.md", "canonicalize.md", "sweep.md", "matching.md",
+           "semantic_compare.md", "validator.md"]
 
 
 def test_all_prompts_exist_with_strict_preamble():
@@ -17,9 +17,22 @@ def test_all_prompts_exist_with_strict_preamble():
 
 def test_prompts_state_their_schemas():
     matching = (PKG / "prompts" / "matching.md").read_text(encoding="utf-8")
-    for key in ["decision", "rule_id", "ambiguous_rule_ids", "row_quote",
-                "rule_quote", "basis"]:
+    for key in ["record_id", "decision", "selections", "ambiguous_rule_ids",
+                "rule_id", "row_quote", "rule_quote", "basis"]:
         assert f'"{key}"' in matching
+    table_mapping = (PKG / "prompts" / "table_mapping.md").read_text(encoding="utf-8")
+    for key in ["table_index", "classification", "irrelevant_reason",
+                "column_mapping", "context_grouping"]:
+        assert f'"{key}"' in table_mapping
+    canonicalize = (PKG / "prompts" / "canonicalize.md").read_text(encoding="utf-8")
+    for key in ["chunk_id", "row_index", "disposition", "records",
+                "sub_index", "fields", "field_provenance",
+                "interpretation_note", "separator_text"]:
+        assert f'"{key}"' in canonicalize
+    sweep = (PKG / "prompts" / "sweep.md").read_text(encoding="utf-8")
+    for key in ["sweep_id", "proposals"]:
+        assert f'"{key}"' in sweep
+    assert "candidates, not matches" in sweep
     semantic = (PKG / "prompts" / "semantic_compare.md").read_text(encoding="utf-8")
     for key in ["finding_type", "verdict", "row_quote", "rule_quote",
                 "interpretation"]:

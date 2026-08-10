@@ -148,7 +148,24 @@ def _minimal_final(tmp_path):
              "classification": "stig_relevant", "irrelevant_reason": "",
              "context_grouping": "JB.1.1", "row_count": 5,
              "column_mapping": {"0": "stig_description"}}],
-        "match_state": [], "ambiguous": [],
+        "match_state": [],
+        "ambiguous": [{
+            "record_id": "CR-amb1",
+            "original_company_text": "ambiguous text",
+            "source_reference": {"table_index": 1, "row_index": 3},
+            "ambiguous_rule_ids": ["V-2001", "V-2002"],
+            "candidates": []}],
+        "unmatched_rows": [{
+            "record_id": "CR-unm1",
+            "original_company_text": "unmatched text",
+            "source_reference": {"table_index": 1, "row_index": 4},
+            "warnings": []}],
+        "unresolved_rows": [{
+            "record_id": "CR-unr1",
+            "original_company_text": "unresolved text",
+            "source_reference": {"table_index": 1, "row_index": 5},
+            "status": "needs-structuring-unresolved",
+            "notes": "needs structuring"}],
         "coverage": {"company": {"total": 1, "matched": 1, "ambiguous": 0,
                                  "unmatched": 0, "ignored_by_rule": 0,
                                  "extraction_failed": 0,
@@ -156,7 +173,7 @@ def _minimal_final(tmp_path):
                      "official": {"total": 5, "addressed": 1, "unaddressed": 4,
                                   "duplicate_coverage_rule_ids": []},
                      "warnings": [], "ok": True},
-        "warnings": [], "unmatched_rows": [], "unaddressed_rules": []}
+        "warnings": [], "unaddressed_rules": []}
     (tmp_path / "final.json").write_text(json.dumps(final), encoding="utf-8")
     return tmp_path
 
@@ -171,3 +188,7 @@ def test_report_renders_triage_and_claim_badges(tmp_path):
     assert "claim-contradicted" in html
     assert "Interpretation (not evidence)" in html
     assert "sweep-originated" in html
+    # Verify record_id appears in leftover sections
+    assert "CR-amb1" in html
+    assert "CR-unm1" in html
+    assert "CR-unr1" in html

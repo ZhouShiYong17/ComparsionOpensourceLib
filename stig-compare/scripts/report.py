@@ -479,7 +479,7 @@ def _ambiguous_html(final):
         cards.append(f"""
 <div class="leftover-card">
   <span class="badge review">HUMAN REVIEW NEEDED</span>
-  <p><b>Row:</b> {esc(a.get('row_id'))} &mdash;
+  <p><b>Row:</b> {esc(a.get('record_id', a.get('row_id', '')))} &mdash;
      <b>Source:</b> {_source_ref_str(a.get('source_reference'))}</p>
   <div class="quote">{esc(a.get('original_company_text'))}</div>
   <p><b>Ambiguous between:</b> {ids}</p>
@@ -498,7 +498,7 @@ def _unresolved_html(final):
         cards.append(f"""
 <div class="leftover-card">
   <span class="badge review">HUMAN REVIEW NEEDED</span>
-  <p><b>Row:</b> {esc(r.get('row_id'))} &mdash;
+  <p><b>Row:</b> {esc(r.get('record_id', r.get('row_id', '')))} &mdash;
      <b>Status:</b> {esc(r.get('status'))} &mdash;
      <b>Source:</b> {_source_ref_str(r.get('source_reference'))}</p>
   <p><b>Notes:</b> {esc(r.get('notes'))}</p>
@@ -517,7 +517,7 @@ def _unmatched_html(final):
         warns = ", ".join(esc(w) for w in r.get("warnings", []) or []) or "none"
         cards.append(f"""
 <div class="leftover-card">
-  <p><b>Row:</b> {esc(r.get('row_id'))} &mdash;
+  <p><b>Row:</b> {esc(r.get('record_id', r.get('row_id', '')))} &mdash;
      <b>Source:</b> {_source_ref_str(r.get('source_reference'))}</p>
   <div class="quote">{esc(r.get('original_company_text'))}</div>
   <p><b>Warnings:</b> {warns}</p>

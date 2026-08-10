@@ -136,21 +136,38 @@ COMPANY_HEADER_SYNONYMS = {
 _COMPANY_FIELDS = list(COMPANY_HEADER_SYNONYMS)
 
 
+def _has_merged_cells(docx_row):
+    """Detect if a docx row has merged cells by checking XML attributes."""
+    from docx.oxml.ns import qn
+    if not docx_row.cells:
+        return False
+    # Check for gridSpan > 1 or vMerge attributes which indicate cell merging
+    for cell in docx_row.cells:
+        tcPr = cell._element.find(qn('w:tcPr'))
+        if tcPr is not None:
+            gridSpan = tcPr.find(qn('w:gridSpan'))
+            vMerge = tcPr.find(qn('w:vMerge'))
+            if gridSpan is not None or vMerge is not None:
+                return True
+    return False
+
+
 def _company_tables(path):
-    """Yield (table_index, sheet_or_section, header_row, data_rows)."""
+    """Yield (table_index, sheet_or_section, header_row, data_rows, merged_flags)."""
     path = Path(path)
     if path.suffix.lower() == ".docx":
         d = docx.Document(str(path))
         for ti, table in enumerate(d.tables, start=1):
             rows = [[c.text for c in row.cells] for row in table.rows]
+            merged_flags = [False] + [_has_merged_cells(row) for row in table.rows[1:]]
             if rows:
-                yield ti, "document-body", rows[0], rows[1:]
+                yield ti, "document-body", rows[0], rows[1:], merged_flags[1:]
     elif path.suffix.lower() == ".xlsx":
         wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
         for ti, ws in enumerate(wb.worksheets, start=1):
             rows = _rows_from_xlsx_sheet(ws)
             if rows:
-                yield ti, f"sheet={ws.title}", rows[0], rows[1:]
+                yield ti, f"sheet={ws.title}", rows[0], rows[1:], [False] * len(rows[1:])
     else:
         raise ValueError(f"unsupported company file type: {path.suffix}")
 
@@ -158,14 +175,14 @@ def _company_tables(path):
 def extract_company(path):
     records, warnings = [], []
     any_table = False
-    for ti, section, headers, data_rows in _company_tables(path):
+    for ti, section, headers, data_rows, merged_flags in _company_tables(path):
         any_table = True
         mapping = _map_headers(headers, COMPANY_HEADER_SYNONYMS)
         mapped_fields = {v for v in mapping.values() if v}
         mappable = len(mapped_fields) >= 3
         if not mappable:
             warnings.append({"code": "unmapped-headers", "detail": f"table={ti}"})
-        for ri, row in enumerate(data_rows, start=1):
+        for ri, (row, has_merged) in enumerate(zip(data_rows, merged_flags), start=1):
             original = " | ".join(str(c) for c in row)
             rec = {f: "" for f in _COMPANY_FIELDS}
             rec["row_id"] = common.row_id(ti, ri, original)
@@ -173,7 +190,13 @@ def extract_company(path):
                                        "sheet_or_section": section}
             rec["original_company_text"] = original
             rec["notes"] = ""
-            if not any(common.fold_ws(str(c)) for c in row):
+            if has_merged:
+                # Merged cells indicate ambiguous content
+                rec["status"] = "needs-structuring"
+                rec["context_grouping"] = common.fold_ws(str(row[0])) if row else ""
+                rec["notes"] = "merged-cells"
+                warnings.append({"code": "merged-cells", "detail": f"table={ti},row={ri}"})
+            elif not any(common.fold_ws(str(c)) for c in row):
                 rec["status"] = "extraction-failed"
                 rec["notes"] = "empty-row"
             elif mappable:

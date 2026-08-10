@@ -5,8 +5,8 @@ import canonical
 FINDING_TYPES = {"equivalent", "stronger", "weaker", "changed-scope",
                  "contradictory", "cannot-determine"}
 VERDICTS = {"Compliant", "Non-Compliant", "Cannot Assess"}
-_MATCH_KEYS = ["decision", "rule_id", "ambiguous_rule_ids",
-               "row_quote", "rule_quote", "basis"]
+_MATCH_KEYS = ["record_id", "decision", "selections", "ambiguous_rule_ids",
+               "basis"]
 _SEM_KEYS = ["finding_type", "verdict", "row_quote", "rule_quote",
              "interpretation"]
 
@@ -24,7 +24,7 @@ def _require(output, keys):
     return [f"missing-key:{k}" for k in keys if k not in output]
 
 
-def validate_match_output(output, shortlist_ids, row, rules_by_id):
+def validate_match_output(output, shortlist_ids, record, rules_by_id):
     errs = _require(output, _MATCH_KEYS)
     if errs:
         return errs
@@ -32,27 +32,51 @@ def validate_match_output(output, shortlist_ids, row, rules_by_id):
     if decision not in ("match", "none", "ambiguous"):
         return ["bad-decision"]
     if decision == "match":
-        rid = output["rule_id"]
-        if rid not in shortlist_ids:
-            errs.append("rule-not-in-shortlist")
-        # Check for empty row_quote after folding
-        if not common.fold_ws(output["row_quote"]):
-            errs.append("row-quote-not-found")
-        elif not quote_exists(output["row_quote"], row["original_company_text"]):
-            errs.append("row-quote-not-found")
-        # Check for empty rule_quote after folding
-        if not common.fold_ws(output["rule_quote"]):
-            errs.append("rule-quote-not-found")
-        elif rid in rules_by_id and not quote_exists(
-                output["rule_quote"], _rule_text(rules_by_id[rid])):
-            errs.append("rule-quote-not-found")
-        elif rid in shortlist_ids and rid not in rules_by_id:
-            # Rule ID is in shortlist but not in rules dict - unverifiable
-            errs.append("rule-quote-not-found")
+        sels = output["selections"]
+        if not isinstance(sels, list) or not sels:
+            return ["no-selections"]
+        seen = set()
+        for sel in sels:
+            if not isinstance(sel, dict):
+                return ["bad-selection"]
+            rid = sel.get("rule_id")
+            if rid not in shortlist_ids:
+                errs.append("rule-not-in-shortlist")
+                continue
+            if rid in seen:
+                errs.append("duplicate-selection")
+                continue
+            seen.add(rid)
+            rq = sel.get("row_quote")
+            if not isinstance(rq, str) or not common.fold_ws(rq) or \
+                    not quote_exists(rq, record["original_company_text"]):
+                errs.append("row-quote-not-found")
+            uq = sel.get("rule_quote")
+            if not isinstance(uq, str) or not common.fold_ws(uq) or \
+                    rid not in rules_by_id or \
+                    not quote_exists(uq, _rule_text(rules_by_id[rid])):
+                errs.append("rule-quote-not-found")
     elif decision == "ambiguous":
         ids = output["ambiguous_rule_ids"]
-        if len(ids) < 2 or not set(ids) <= set(shortlist_ids):
+        if not isinstance(ids, list) or len(ids) < 2 or \
+                not set(ids) <= set(shortlist_ids):
             errs.append("ambiguous-needs-two")
+    return errs
+
+
+def validate_sweep_output(output, batch_record_ids, index_rule_ids):
+    errs = _require(output, ["sweep_id", "proposals"])
+    if errs:
+        return errs
+    props = output["proposals"]
+    if not isinstance(props, list):
+        return ["bad-proposals"]
+    for p in props:
+        if not isinstance(p, dict) or \
+                p.get("record_id") not in batch_record_ids or \
+                p.get("rule_id") not in index_rule_ids:
+            errs.append("bad-proposal")
+            break
     return errs
 
 

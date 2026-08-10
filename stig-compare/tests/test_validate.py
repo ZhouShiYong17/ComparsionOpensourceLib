@@ -23,41 +23,89 @@ _GOOD_MAPPING = {"table_index": 1, "classification": "stig_relevant",
                  "context_grouping": "JB.1.1 STIG HARDEING- SEVERITY HIGH"}
 
 
-def _good_match():
-    return {"decision": "match", "rule_id": "V-1001", "ambiguous_rule_ids": [],
-            "row_quote": "Password reuse must be restricted",
-            "rule_quote": "password_reuse_max", "basis": "same requirement"}
-
-
 def test_quote_exists_whitespace_folded():
     assert validate.quote_exists("reuse  must   be", "reuse must be restricted")
     assert not validate.quote_exists("not present", "reuse must be restricted")
 
 
-def test_valid_match_passes():
-    assert validate.validate_match_output(_good_match(), ["V-1001"], _ROW, _RULES) == []
+_REC = {"record_id": "CR-1", "original_company_text":
+        "Password reuse must be restricted | Run SHOW PARAMETER password_reuse_max"}
+_RULES = {"V-1001": {"rule_id": "V-1001",
+                     "title": "Password reuse must be restricted",
+                     "check_text": "Run SHOW PARAMETER password_reuse_max",
+                     "fix_text": "Set password_reuse_max to 9 or more."},
+          "V-1003": {"rule_id": "V-1003", "title": "Audit logging enabled",
+                     "check_text": "Verify audit logging", "fix_text": ""}}
+_SHORT = ["V-1001", "V-1003"]
 
 
-def test_rule_outside_shortlist_rejected():
-    out = _good_match()
-    out["rule_id"] = "V-9999"
-    errs = validate.validate_match_output(out, ["V-1001"], _ROW, _RULES)
-    assert "rule-not-in-shortlist" in errs
+def _match_resp(**kw):
+    base = {"record_id": "CR-1", "decision": "match",
+            "selections": [{"rule_id": "V-1001",
+                            "row_quote": "Run SHOW PARAMETER password_reuse_max",
+                            "rule_quote": "Run SHOW PARAMETER password_reuse_max"}],
+            "ambiguous_rule_ids": [], "basis": "same parameter"}
+    base.update(kw)
+    return base
 
 
-def test_invented_quote_rejected():
-    out = _good_match()
-    out["row_quote"] = "text that was never in the row"
-    errs = validate.validate_match_output(out, ["V-1001"], _ROW, _RULES)
-    assert "row-quote-not-found" in errs
+def test_match_multi_select_valid():
+    assert validate.validate_match_output(_match_resp(), _SHORT, _REC, _RULES) == []
 
 
-def test_ambiguous_needs_two():
-    out = {"decision": "ambiguous", "rule_id": None,
-           "ambiguous_rule_ids": ["V-1001"], "row_quote": "9",
-           "rule_quote": "password_reuse_max", "basis": "unclear"}
-    errs = validate.validate_match_output(out, ["V-1001", "V-1002"], _ROW, _RULES)
-    assert "ambiguous-needs-two" in errs
+def test_match_two_selections_valid():
+    two = _match_resp(selections=[
+        {"rule_id": "V-1001",
+         "row_quote": "Run SHOW PARAMETER password_reuse_max",
+         "rule_quote": "Run SHOW PARAMETER password_reuse_max"},
+        {"rule_id": "V-1003",
+         "row_quote": "Password reuse must be restricted",
+         "rule_quote": "Verify audit logging"}])
+    assert validate.validate_match_output(two, _SHORT, _REC, _RULES) == []
+
+
+def test_match_rejects_empty_selections_and_duplicates():
+    assert "no-selections" in validate.validate_match_output(
+        _match_resp(selections=[]), _SHORT, _REC, _RULES)
+    dup = _match_resp()
+    dup["selections"] = dup["selections"] * 2
+    assert "duplicate-selection" in validate.validate_match_output(
+        dup, _SHORT, _REC, _RULES)
+
+
+def test_match_rejects_off_shortlist_and_bad_quotes():
+    off = _match_resp()
+    off["selections"][0]["rule_id"] = "V-9999"
+    assert "rule-not-in-shortlist" in validate.validate_match_output(
+        off, _SHORT, _REC, _RULES)
+    bad = _match_resp()
+    bad["selections"][0]["row_quote"] = "invented text"
+    assert "row-quote-not-found" in validate.validate_match_output(
+        bad, _SHORT, _REC, _RULES)
+
+
+def test_match_none_and_ambiguous_still_work():
+    none = _match_resp(decision="none", selections=[])
+    assert validate.validate_match_output(none, _SHORT, _REC, _RULES) == []
+    amb = _match_resp(decision="ambiguous", selections=[],
+                      ambiguous_rule_ids=["V-1001", "V-1003"])
+    assert validate.validate_match_output(amb, _SHORT, _REC, _RULES) == []
+    amb1 = _match_resp(decision="ambiguous", selections=[],
+                       ambiguous_rule_ids=["V-1001"])
+    assert "ambiguous-needs-two" in validate.validate_match_output(
+        amb1, _SHORT, _REC, _RULES)
+
+
+def test_sweep_output():
+    good = {"sweep_id": "S0",
+            "proposals": [{"record_id": "CR-1", "rule_id": "V-1003"}]}
+    assert validate.validate_sweep_output(good, {"CR-1"}, {"V-1003"}) == []
+    empty = {"sweep_id": "S0", "proposals": []}
+    assert validate.validate_sweep_output(empty, {"CR-1"}, {"V-1003"}) == []
+    bad = {"sweep_id": "S0",
+           "proposals": [{"record_id": "CR-2", "rule_id": "V-1003"}]}
+    assert "bad-proposal" in validate.validate_sweep_output(
+        bad, {"CR-1"}, {"V-1003"})
 
 
 def test_semantic_bad_type_and_missing_key():
@@ -82,24 +130,6 @@ def test_dedup_and_contradictions():
                         "code": "contradictory-verdicts"}]
 
 
-def test_empty_row_quote_rejected():
-    out = _good_match()
-    out["row_quote"] = ""
-    errs = validate.validate_match_output(out, ["V-1001"], _ROW, _RULES)
-    assert "row-quote-not-found" in errs
-
-
-def test_empty_rule_quote_rejected():
-    out = _good_match()
-    out["rule_quote"] = ""
-    errs = validate.validate_match_output(out, ["V-1001"], _ROW, _RULES)
-    assert "rule-quote-not-found" in errs
-
-
-def test_rule_id_in_shortlist_but_missing_from_rules_dict():
-    out = _good_match()
-    errs = validate.validate_match_output(out, ["V-1001"], _ROW, {})
-    assert "rule-quote-not-found" in errs
 
 
 def test_table_mapping_valid():

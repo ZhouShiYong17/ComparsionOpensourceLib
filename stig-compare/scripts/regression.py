@@ -32,7 +32,8 @@ _ROW_FIELDS = ["stig_description", "stig_objective_or_requirement",
                "stig_command_or_value",
                "company_approved_setting_or_expected_value",
                "observed_value_or_evidence", "context_grouping",
-               "original_company_text"]
+               "original_company_text", "company_compliance_claim",
+               "company_severity", "remarks_or_justification"]
 
 
 def _ignore_fields_for(company_row, registry):
@@ -66,19 +67,30 @@ def _replay_row(company_row, registry):
 
 def run_case(case, registry):
     """Replay the deterministic stages of one regression case's snapshot
-    and evaluate it against `expected` (spec section 9/13-14)."""
+    and evaluate it against `expected` (spec section 9/13-14).
+
+    Old regression case files (RC-*.json) predate the record_id/canonical-
+    record era and carry a company_row keyed only by row_id, with no
+    record_id or status field. The setdefaults below backfill both so those
+    old snapshots keep replaying unedited: candidates_mod.generate() now
+    requires row["record_id"] and skips rows whose status isn't "ok".
+    """
     case_id = case["case_id"]
     snapshot = case["snapshot"]
     official_rules = snapshot["official_rules"]
     expected = case.get("expected", {}) or {}
 
-    row = _replay_row(snapshot["company_row"], registry)
+    row = dict(snapshot["company_row"])
+    row.setdefault("record_id", row.get("row_id", "regression-row"))
+    row.setdefault("status", "ok")
+    row = _replay_row(row, registry)
     rules_by_id = {r["rule_id"]: r for r in official_rules}
 
     matches = candidates_mod.generate([row], official_rules)
-    match = matches[0] if matches else {"tier": None, "matched_rule_id": None}
+    match = matches[0] if matches else {"tier": None, "matched_rule_ids": []}
     tier = match.get("tier")
-    matched_rule_id = match.get("matched_rule_id")
+    matched = match.get("matched_rule_ids") or []
+    matched_rule_id = matched[0] if matched else None
     deterministic_matched = tier in _DETERMINISTIC_TIERS and \
         matched_rule_id is not None
 

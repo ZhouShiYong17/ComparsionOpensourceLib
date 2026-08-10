@@ -69,11 +69,12 @@ def _load_replay_lookups(run_dir):
     of failing ingestion entirely.
     """
     run_dir = Path(run_dir)
-    rows_path = run_dir / "company_rows.jsonl"
+    rows_path = run_dir / "company_records.jsonl"
     rules_path = run_dir / "official_rules.jsonl"
     if not rows_path.exists() or not rules_path.exists():
         return None, None
-    rows_by_id = {r["row_id"]: r for r in common.read_jsonl(rows_path)}
+    rows_by_id = {r.get("record_id", r.get("row_id")): r
+                  for r in common.read_jsonl(rows_path)}
     rules_by_id = {r["rule_id"]: r for r in common.read_jsonl(rules_path)}
     return rows_by_id, rules_by_id
 
@@ -114,7 +115,8 @@ def _build_snapshot(finding, manifest, rows_by_id=None, rules_by_id=None):
             "versions": manifest.get("versions", {}) or {},
         },
     }
-    full_row = (rows_by_id or {}).get(finding.get("row_id"))
+    full_row = (rows_by_id or {}).get(
+        finding.get("record_id", finding.get("row_id")))
     full_rule = (rules_by_id or {}).get(finding.get("rule_id"))
     if full_row is not None and full_rule is not None:
         snapshot["company_row"] = full_row

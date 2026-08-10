@@ -169,7 +169,7 @@ def test_ingest_produces_replayable_case_for_correct_classification(tmp_path):
     (pkg / "rules" / "registry.json").write_text(
         json.dumps({"registry_version": 1, "rules": []}), encoding="utf-8")
 
-    company_row = _SNAPSHOT["company_row"]
+    company_row = dict(_SNAPSHOT["company_row"], record_id="CR-aaaa0001")
     official_rule = _SNAPSHOT["official_rules"][0]
 
     run = tmp_path / "run"
@@ -179,7 +179,8 @@ def test_ingest_produces_replayable_case_for_correct_classification(tmp_path):
                      "official_sha256": "a" * 64, "company_sha256": "b" * 64,
                      "versions": {"skill_version": "0.1.0"}},
         "findings": [{
-            "finding_id": "F-11112222", "row_id": company_row["row_id"],
+            "finding_id": "F-11112222", "record_id": company_row["record_id"],
+            "row_id": company_row["row_id"],
             "rule_id": official_rule["rule_id"], "verdict": "Compliant",
             "match": {"tier": "T1"},
             "company_row": {
@@ -187,7 +188,7 @@ def test_ingest_produces_replayable_case_for_correct_classification(tmp_path):
                 "source_reference": {}},
             "official_rule": official_rule}]}
     (run / "final.json").write_text(json.dumps(final), encoding="utf-8")
-    (run / "company_rows.jsonl").write_text(
+    (run / "company_records.jsonl").write_text(
         json.dumps(company_row) + "\n", encoding="utf-8")
     (run / "official_rules.jsonl").write_text(
         json.dumps(official_rule) + "\n", encoding="utf-8")
@@ -210,3 +211,29 @@ def test_ingest_produces_replayable_case_for_correct_classification(tmp_path):
     assert suite["total"] == 1
     assert suite["passed"] == 1
     assert suite["failed"] == 0
+
+
+# -- Task 16: old regression case files (RC-*.json snapshots keyed by
+# row_id, no record_id/status) must keep replaying without edits.
+
+
+def test_run_case_accepts_legacy_row_id_snapshot():
+    case = {"case_id": "RC-legacy", "snapshot": {
+        "company_row": {
+            "row_id": "R-old", "status": "ok",
+            "original_company_text":
+                "Run SHOW PARAMETER password_reuse_max | 9 or more | 9",
+            "context_grouping": "High",
+            "stig_command_or_value": "Run SHOW PARAMETER password_reuse_max",
+            "observed_value_or_evidence": "9"},
+        "official_rules": [{
+            "rule_id": "V-1001",
+            "title": "Password reuse must be restricted",
+            "severity": "high",
+            "check_text": "Run SHOW PARAMETER password_reuse_max",
+            "fix_text": "Set password_reuse_max to 9 or more.",
+            "expected_value": "9 or more"}]},
+        "expected": {"matched_rule_id": "V-1001", "verdict": "Compliant"}}
+    registry = {"registry_version": 1, "rules": []}
+    result = regression.run_case(case, registry)
+    assert result["passed"], result["detail"]

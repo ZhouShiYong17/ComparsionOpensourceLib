@@ -10,6 +10,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+import docx
 import openpyxl
 
 import common
@@ -117,8 +118,77 @@ def extract_official(path):
     return {"records": records, "warnings": warnings}
 
 
+COMPANY_HEADER_SYNONYMS = {
+    "context_grouping": ["group", "grouping", "category", "severity group"],
+    "stig_description": ["description", "details", "notes"],
+    "stig_objective_or_requirement": ["stig requirement", "requirement",
+                                      "objective", "control", "policy"],
+    "stig_command_or_value": ["command to verify", "how to check",
+                              "check command", "command", "verification",
+                              "validation method"],
+    "company_approved_setting_or_expected_value": ["approved setting",
+                                                   "expected value", "baseline",
+                                                   "approved value", "setting"],
+    "observed_value_or_evidence": ["observed value", "evidence", "actual value",
+                                   "result", "observed"],
+}
+
+_COMPANY_FIELDS = list(COMPANY_HEADER_SYNONYMS)
+
+
+def _company_tables(path):
+    """Yield (table_index, sheet_or_section, header_row, data_rows)."""
+    path = Path(path)
+    if path.suffix.lower() == ".docx":
+        d = docx.Document(str(path))
+        for ti, table in enumerate(d.tables, start=1):
+            rows = [[c.text for c in row.cells] for row in table.rows]
+            if rows:
+                yield ti, "document-body", rows[0], rows[1:]
+    elif path.suffix.lower() == ".xlsx":
+        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+        for ti, ws in enumerate(wb.worksheets, start=1):
+            rows = _rows_from_xlsx_sheet(ws)
+            if rows:
+                yield ti, f"sheet={ws.title}", rows[0], rows[1:]
+    else:
+        raise ValueError(f"unsupported company file type: {path.suffix}")
+
+
 def extract_company(path):
-    raise NotImplementedError
+    records, warnings = [], []
+    any_table = False
+    for ti, section, headers, data_rows in _company_tables(path):
+        any_table = True
+        mapping = _map_headers(headers, COMPANY_HEADER_SYNONYMS)
+        mapped_fields = {v for v in mapping.values() if v}
+        mappable = len(mapped_fields) >= 3
+        if not mappable:
+            warnings.append({"code": "unmapped-headers", "detail": f"table={ti}"})
+        for ri, row in enumerate(data_rows, start=1):
+            original = " | ".join(str(c) for c in row)
+            rec = {f: "" for f in _COMPANY_FIELDS}
+            rec["row_id"] = common.row_id(ti, ri, original)
+            rec["source_reference"] = {"table_index": ti, "row_index": ri,
+                                       "sheet_or_section": section}
+            rec["original_company_text"] = original
+            rec["notes"] = ""
+            if not any(common.fold_ws(str(c)) for c in row):
+                rec["status"] = "extraction-failed"
+                rec["notes"] = "empty-row"
+            elif mappable:
+                rec["status"] = "ok"
+                for idx, val in enumerate(row):
+                    canon = mapping.get(idx)
+                    if canon:
+                        rec[canon] = common.fold_ws(str(val))
+            else:
+                rec["status"] = "needs-structuring"
+                rec["context_grouping"] = common.fold_ws(str(row[0])) if row else ""
+            records.append(rec)
+    if not any_table:
+        warnings.append({"code": "no-tables-found", "detail": "0 tables"})
+    return {"records": records, "warnings": warnings}
 
 
 def main(argv=None):

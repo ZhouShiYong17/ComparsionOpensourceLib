@@ -19,17 +19,31 @@ def run(tmp_path):
     return run_dir
 
 
-def test_start_produces_artifacts_and_t1_match(run):
-    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+def test_start_writes_skeleton_and_mapping_requests(tmp_path):
+    fx = build_all(tmp_path / "fx")
+    run_dir = tmp_path / "run"
+    rc = pipeline.main(["start",
+                        "--official", str(fx["official_csv"]),
+                        "--company", str(fx["company_real_docx"]),
+                        "--run-dir", str(run_dir)])
+    assert rc == 0
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     assert len(manifest["official_sha256"]) == 64
     assert "skill_version" in manifest["versions"]
-    state = common.read_jsonl(run / "match_state.jsonl")
-    by_tier = {}
-    for m in state:
-        by_tier.setdefault(m["tier"], []).append(m)
-    assert len(by_tier.get("T1", [])) >= 1          # password_reuse_max row
-    requests = common.read_jsonl(run / "matching_requests.jsonl")
-    assert all(r["candidates"] for r in requests)
+    skel = json.loads((run_dir / "skeleton.json").read_text(encoding="utf-8"))
+    assert len(skel["tables"]) == 4
+    reqs = common.read_jsonl(run_dir / "table_mapping_requests.jsonl")
+    assert len(reqs) == 4
+    assert reqs[2]["header_row"][0] == "STIG REQUIREMENT"
+    assert reqs[2]["instructions_file"] == "prompts/table_mapping.md"
+    assert "header_hints" in reqs[2]
+    tstate = common.read_jsonl(run_dir / "table_state.jsonl")
+    assert all(t["classification"] is None for t in tstate)
+    assert common.read_jsonl(run_dir / "match_state.jsonl") == []
+    assert common.read_jsonl(run_dir / "company_records.jsonl") == []
+    assert not (run_dir / "company_rows.jsonl").exists()
+    assert not (run_dir / "structuring_requests.jsonl").exists()
+    assert not (run_dir / "matching_requests.jsonl").exists()
 
 
 def test_resolve_accepts_valid_match_and_rejects_invented_rule(run):

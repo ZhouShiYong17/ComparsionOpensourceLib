@@ -142,6 +142,8 @@ COMPANY_HEADER_SYNONYMS = {
                                    "result", "observed"],
 }
 
+COMPANY_HEADER_HINTS = COMPANY_HEADER_SYNONYMS
+
 _COMPANY_FIELDS = list(COMPANY_HEADER_SYNONYMS)
 
 

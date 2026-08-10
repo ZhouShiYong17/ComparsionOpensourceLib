@@ -22,12 +22,14 @@ from datetime import datetime
 from pathlib import Path
 
 import candidates as candidates_mod
+import canonical
 import common
 import compare_values
 import coverage as coverage_mod
 import extract
 import normalize
 import rules as rules_mod
+import skeleton
 import validate
 
 PKG_ROOT = Path(__file__).resolve().parent.parent
@@ -37,13 +39,6 @@ _COMPANY_NORM_FIELDS = ["stig_description", "stig_objective_or_requirement",
                         "company_approved_setting_or_expected_value",
                         "observed_value_or_evidence"]
 _OFFICIAL_NORM_FIELDS = ["title", "check_text", "fix_text", "expected_value"]
-
-# Fields a structuring response may extract (context_grouping is already known
-# from the request itself, so it is not part of what Claude must recover).
-_STRUCT_FIELDS = ["stig_description", "stig_objective_or_requirement",
-                  "stig_command_or_value",
-                  "company_approved_setting_or_expected_value",
-                  "observed_value_or_evidence"]
 
 _MATCHED_TIERS = ("T0", "T1", "T2")
 
@@ -140,7 +135,8 @@ def _load_consumed(run_dir):
         data = json.loads(p.read_text(encoding="utf-8"))
     else:
         data = {}
-    for k in ("structuring", "matching", "semantic", "skeptic"):
+    for k in ("table_mapping", "canonicalize", "matching", "sweep", "semantic",
+              "skeptic"):
         data.setdefault(k, [])
     return data
 
@@ -305,12 +301,11 @@ def cmd_start(args):
     run_dir.mkdir(parents=True, exist_ok=True)
     try:
         official = extract.extract_official(args.official)
-        company = extract.extract_company(args.company)
+        skel = skeleton.extract_skeleton(args.company)
     except Exception as e:                        # no document text in errors
         print(f"pipeline: cannot read file: {type(e).__name__}", file=sys.stderr)
         return 2
     normalize.add_normalized(official["records"], _OFFICIAL_NORM_FIELDS)
-    normalize.add_normalized(company["records"], _COMPANY_NORM_FIELDS)
 
     registry = rules_mod.load_registry(PKG_ROOT / "rules" / "registry.json")
     doc_type = Path(args.company).suffix.lstrip(".").lower()
@@ -331,38 +326,34 @@ def cmd_start(args):
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=1), encoding="utf-8")
     common.write_jsonl(run_dir / "official_rules.jsonl", official["records"])
-    common.write_jsonl(run_dir / "company_rows.jsonl", company["records"])
+    (run_dir / "skeleton.json").write_text(
+        json.dumps(skel, indent=1), encoding="utf-8")
     (run_dir / "extract_warnings.json").write_text(json.dumps(
-        official["warnings"] + company["warnings"], indent=1), encoding="utf-8")
+        official["warnings"] + skel["warnings"], indent=1), encoding="utf-8")
 
-    match_state = candidates_mod.generate(company["records"], official["records"])
-    common.write_jsonl(run_dir / "match_state.jsonl", match_state)
+    mapping_requests = [
+        {"table_index": t["table_index"],
+         "sheet_or_section": t["sheet_or_section"],
+         "preceding_narrative": t["preceding_narrative"],
+         "header_row": t["header_row"],
+         "sample_rows": [r["cells"] for r in t["rows"][:5]],
+         "row_count": len(t["rows"]),
+         "header_hints": extract.COMPANY_HEADER_HINTS,
+         "instructions_file": "prompts/table_mapping.md"}
+        for t in skel["tables"]]
+    common.write_jsonl(run_dir / "table_mapping_requests.jsonl",
+                       mapping_requests)
+    common.write_jsonl(run_dir / "table_state.jsonl", [
+        {"table_index": t["table_index"], "classification": None,
+         "irrelevant_reason": "", "column_mapping": {},
+         "context_grouping": "", "mapping_failures": 0,
+         "row_dispositions": {}, "parent_of": {}, "chunks": {}}
+        for t in skel["tables"]])
+    common.write_jsonl(run_dir / "company_records.jsonl", [])
+    common.write_jsonl(run_dir / "match_state.jsonl", [])
 
-    structuring = [
-        {"row_id": r["row_id"],
-         "original_company_text": r["original_company_text"],
-         "context_grouping": r["context_grouping"],
-         "instructions_file": "prompts/structuring.md"}
-        for r in company["records"] if r["status"] == "needs-structuring"]
-    common.write_jsonl(run_dir / "structuring_requests.jsonl", structuring)
-
-    rules_by_id = {r["rule_id"]: r for r in official["records"]}
-    rows_by_id = {r["row_id"]: r for r in company["records"]}
-    matching = [
-        {"row_id": m["row_id"], "row": rows_by_id[m["row_id"]],
-         "candidates": [rules_by_id[c["rule_id"]] | {"_score": c["score"]}
-                        for c in m["candidates"]],
-         "instructions_file": "prompts/matching.md"}
-        for m in match_state
-        if m["tier"] is None and m["candidates"]
-        and rows_by_id[m["row_id"]]["status"] == "ok"]
-    common.write_jsonl(run_dir / "matching_requests.jsonl", matching)
-
-    t_counts = {}
-    for m in match_state:
-        t_counts[m["tier"]] = t_counts.get(m["tier"], 0) + 1
-    print(f"start: tiers={t_counts} structuring_pending={len(structuring)} "
-          f"matching_pending={len(matching)}")
+    print(f"start: tables={len(skel['tables'])} "
+          f"mapping_pending={len(mapping_requests)}")
     return 0
 
 

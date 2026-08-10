@@ -59,5 +59,12 @@ One record from `semantic_requests.jsonl`:
 - `row_quote` must be copied verbatim from `row`'s text; `rule_quote` must
   be copied verbatim from `rule`'s `title`/`check_text`/`fix_text`. Both
   are observation only — no reasoning inside a quote.
+- `row_quote` and `rule_quote` must NEVER be empty, in every response you
+  send, with no exception for `"Cannot Assess"` or `"cannot-determine"`.
+  If the row's evidence is missing or unclear, still quote the nearest
+  relevant fragment — e.g. the row field text that fails to supply the
+  needed evidence, and the rule's `expected_value`/`check_text` fragment
+  it fails to satisfy. An empty quote is rejected unconditionally; `""`
+  is never a valid answer here (unlike the structuring prompt's fields).
 - `interpretation` is the ONLY field for your reasoning and conclusions.
   Keep `row_quote`/`rule_quote` limited to what the texts literally say.

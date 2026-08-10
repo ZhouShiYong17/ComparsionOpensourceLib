@@ -61,11 +61,11 @@ A missing key invalidates the whole response.
   a forced, uncertain `"match"`.
 - Similar `severity` alone (e.g. both "high"/"CAT I") is NEVER sufficient
   basis for a match — it must never be the deciding factor.
-- `row_quote` must be copied verbatim from the row's text and must be the
-  specific fragment that discriminates this candidate from the others —
-  not generic or boilerplate text.
-- `rule_quote` must be copied verbatim from the chosen candidate's
+- For `decision: "match"`: `row_quote` must be copied verbatim from the
+  row's text and must be the specific fragment that discriminates this
+  candidate from the others — not generic or boilerplate text. `rule_quote`
+  must be copied verbatim from the chosen candidate's
   `title`/`check_text`/`fix_text` and must likewise be the discriminating
-  evidence, not filler.
+  evidence, not filler. Both must be non-empty.
 - `basis` is a short phrase, in your own words, naming what discriminated
   this decision. It is not a quote.

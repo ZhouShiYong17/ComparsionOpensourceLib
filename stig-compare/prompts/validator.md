@@ -18,12 +18,27 @@ first pass's `interpretation`/reasoning, so you form your own conclusion:
 
 - `finding_id` (string) — echo back unchanged.
 - `row_id`, `rule_id` — identify the finding.
-- `verdict`, `finding_type` — the first pass's claimed conclusion. This is
-  the CLAIM you are testing, not a fact to trust.
-- `row_quote`, `rule_quote` — the exact quotes the first pass cited.
-- `company_row` — the row's full raw text and `source_reference`.
-- `official_rule` — the rule's full raw text (`title`, `check_text`,
-  `fix_text`, `expected_value`).
+- `verdict` — the first pass's claimed conclusion. This is the CLAIM you
+  are testing, not a fact to trust.
+- `finding_type` — may be `null` for a deterministic finding (no semantic
+  pass ran for it).
+- `observation` — its shape depends on how the finding was produced:
+  - Semantic findings: `{"row_quote": "...", "rule_quote": "..."}` — the
+    exact quotes the first pass cited.
+  - Deterministic findings (`finding_type` is `null`): `{"observed": "...",
+    "expected": "...", "relation": "..."}` (the `relation` key may be
+    absent). There is NO `row_quote`/`rule_quote` here — a deterministic
+    finding carries no quotes at all, so there is nothing to misquote;
+    focus instead on whether `observed`/`expected` genuinely support the
+    `verdict`.
+  - Some findings (rejected-output or not-run placeholders) have
+    `observation: null` entirely.
+- `company_row` — `{"original_company_text": "...", "source_reference":
+  {...}}` — the row's full raw text and its location. Only these two
+  fields; the structured company fields are not included.
+- `official_rule` — `{"rule_id": "...", "title": "...", "check_text":
+  "...", "expected_value": "..."}` — note there is NO `fix_text` and NO
+  `severity` here.
 
 ## Output schema
 
@@ -38,11 +53,15 @@ first pass's `interpretation`/reasoning, so you form your own conclusion:
 ## Decision guide
 
 Your goal is to DISPROVE the finding under review. Actively hunt for:
-- **Misquotes** — a `row_quote`/`rule_quote` that does not actually appear
-  verbatim in the raw text it claims to come from, or that was subtly
-  altered.
-- **Wrong-record comparisons** — a quote pulled from the wrong row or the
-  wrong rule, not the one named by `row_id`/`rule_id`.
+- **Misquotes** — when `observation` has `row_quote`/`rule_quote` (semantic
+  findings only), check whether either one actually appears verbatim in
+  `company_row`/`official_rule`'s raw text, or was subtly altered.
+  Deterministic findings (`observation` has `observed`/`expected` instead,
+  or is `null`) carry no quotes — there is nothing to misquote-check; skip
+  this test for them.
+- **Wrong-record comparisons** — a quote, or an `observed`/`expected`
+  value, that doesn't actually belong to the row/rule named by
+  `row_id`/`rule_id`.
 - **Meaning-changing normalization** — a paraphrase or summary that
   quietly changes what the original text said.
 - **Formatting-only differences misclassified as semantic** — a

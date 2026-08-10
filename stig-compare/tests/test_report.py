@@ -108,3 +108,66 @@ def test_semantic_finding_shows_finding_type_and_interpretation(tmp_path):
         r'<article class="finding" data-fid="F-11112222".*?</article>',
         html_text, re.S).group(0)
     assert "Interpretation" not in art
+
+
+def _minimal_final(tmp_path):
+    """Minimal final.json structure for triage/claim badge tests."""
+    final = {
+        "manifest": {"official_file": "o.csv", "company_file": "c.docx",
+                     "official_sha256": "a" * 64, "company_sha256": "b" * 64,
+                     "started": "2026-08-10T12:00:00",
+                     "versions": {"skill_version": "0.1.0", "prompt_hashes": {}},
+                     "registry_version": 1, "rule_conflicts": []},
+        "findings": [{
+            "finding_id": "F-11112222", "row_id": "R-aaaa0001",
+            "record_id": "CR-1",
+            "rule_id": "V-1001", "verdict": "Compliant",
+            "finding_type": None, "deterministic": True,
+            "confidence": "High", "human_review_needed": False,
+            "basis": "value-comparison",
+            "observation": {"observed": "9", "expected": "9 or more"},
+            "interpretation": None, "skeptic": None, "applied_rules": [],
+            "match": {"tier": "T1", "candidates": [
+                {"rule_id": "V-1001", "score": 3.2}]},
+            "company_row": {"original_company_text":
+                            "High | <b>reuse</b> | 9",
+                            "source_reference": {"table_index": 1,
+                                                 "row_index": 1}},
+            "official_rule": {"rule_id": "V-1001", "title": "Password reuse",
+                              "check_text": "check", "expected_value": "9 or more"},
+            "claim_flags": ["company-declared-deviation", "claim-contradicted"],
+            "claim_normalized": "deviation",
+            "company_compliance_claim": "DEVIATION",
+            "interpretation_note": "reviewer note",
+            "sweep_originated": True}],
+        "table_triage": [
+            {"table_index": 1, "sheet_or_section": "document-body",
+             "classification": "irrelevant", "irrelevant_reason": "instructions",
+             "context_grouping": "", "row_count": 3, "column_mapping": {}},
+            {"table_index": 2, "sheet_or_section": "document-body",
+             "classification": "stig_relevant", "irrelevant_reason": "",
+             "context_grouping": "JB.1.1", "row_count": 5,
+             "column_mapping": {"0": "stig_description"}}],
+        "match_state": [], "ambiguous": [],
+        "coverage": {"company": {"total": 1, "matched": 1, "ambiguous": 0,
+                                 "unmatched": 0, "ignored_by_rule": 0,
+                                 "extraction_failed": 0,
+                                 "needs_structuring_unresolved": 0},
+                     "official": {"total": 5, "addressed": 1, "unaddressed": 4,
+                                  "duplicate_coverage_rule_ids": []},
+                     "warnings": [], "ok": True},
+        "warnings": [], "unmatched_rows": [], "unaddressed_rules": []}
+    (tmp_path / "final.json").write_text(json.dumps(final), encoding="utf-8")
+    return tmp_path
+
+
+def test_report_renders_triage_and_claim_badges(tmp_path):
+    run_dir = _minimal_final(tmp_path)
+    report.render(run_dir)
+    html = (run_dir / "report.html").read_text(encoding="utf-8")
+    assert "Table triage" in html
+    assert "irrelevant" in html and "instructions" in html
+    assert "company-declared-deviation" in html
+    assert "claim-contradicted" in html
+    assert "Interpretation (not evidence)" in html
+    assert "sweep-originated" in html

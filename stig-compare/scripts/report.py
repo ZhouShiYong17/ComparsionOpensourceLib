@@ -60,8 +60,11 @@ section{margin:1.6rem 0}
 .badge.review{background:#fef0c7;color:#7a2e0e}
 .badge.disputed{background:#fef3f2;color:var(--bad);border:1px solid var(--bad)}
 .badge.finding-type{background:#eef2ff;color:#3538cd}
+.badge-claim{background:#7a1f1f;color:#fff;border-radius:3px;padding:1px 6px;margin-left:6px;font-size:11px}
+.badge-sweep{background:#5b4a12;color:#fff;border-radius:3px;padding:1px 6px;margin-left:6px;font-size:11px}
 .interpretation{background:#f2f4f7;border-left:3px solid #3538cd;
                 padding:.4rem .7rem;margin:.3rem 0}
+.interp{border-left:3px solid #888;padding:4px 8px;margin:6px 0;font-style:italic;opacity:.85}
 .quote{background:#f2f4f7;border-left:3px solid #98a2b3;padding:.3rem .6rem;
        font-family:Consolas,monospace;font-size:.85rem;white-space:pre-wrap}
 .quote-label{font-size:.75rem;color:var(--muted);text-transform:uppercase;
@@ -73,6 +76,7 @@ table{border-collapse:collapse;width:100%;margin:.4rem 0}
 td,th{border:1px solid #e4e7ec;padding:.3rem .6rem;font-size:.85rem;
       text-align:left}
 th{background:#f9fafb}
+.triage-table td,.triage-table th{padding:4px 8px;border-bottom:1px solid #333}
 .hidden{display:none}
 .filters{margin:.6rem 0 1rem;display:flex;gap:1rem;flex-wrap:wrap;
          align-items:center;font-size:.85rem}
@@ -265,6 +269,29 @@ def _dashboard_html(final):
 
 
 # --------------------------------------------------------------------------
+# triage
+# --------------------------------------------------------------------------
+
+def _triage_html(final):
+    rows = []
+    for t in final.get("table_triage", []):
+        cls = esc(str(t.get("classification")))
+        rows.append(
+            f"<tr><td>{t['table_index']}</td>"
+            f"<td>{esc(t.get('sheet_or_section', ''))}</td>"
+            f"<td>{cls}</td>"
+            f"<td>{esc(t.get('irrelevant_reason', ''))}</td>"
+            f"<td>{esc(t.get('context_grouping', ''))}</td>"
+            f"<td>{t.get('row_count', 0)}</td></tr>")
+    if not rows:
+        return ""
+    return ("<section><h2>Table triage</h2>"
+            "<table class='triage-table'><tr><th>#</th><th>Location</th>"
+            "<th>Classification</th><th>Reason</th><th>Grouping</th>"
+            "<th>Rows</th></tr>" + "".join(rows) + "</table></section>")
+
+
+# --------------------------------------------------------------------------
 # findings
 # --------------------------------------------------------------------------
 
@@ -328,11 +355,13 @@ def _finding_html(f):
     disputed = bool(f.get("disputed"))
     finding_type = f.get("finding_type")
     interpretation = f.get("interpretation")
+    interpretation_note = f.get("interpretation_note")
     company = f.get("company_row", {}) or {}
     official = f.get("official_rule", {}) or {}
     match = f.get("match", {}) or {}
     skeptic = f.get("skeptic")
     applied_rules = f.get("applied_rules", []) or []
+    display_id = f.get("record_id", f.get("row_id"))
 
     badges = [
         f'<span class="badge {esc(_verdict_css(verdict))}">{esc(verdict)}</span>',
@@ -351,6 +380,13 @@ def _finding_html(f):
         badges.append(
             '<span class="badge disputed">DISPUTED &mdash; skeptic refuted'
             '</span>')
+    # Add claim badges
+    claim_badges = "".join(
+        f'<span class="badge-claim">{esc(fl)}</span>'
+        for fl in f.get("claim_flags", []))
+    sweep_badge = (
+        '<span class="badge-sweep">sweep-originated</span>'
+        if f.get("sweep_originated") else '')
 
     if skeptic:
         skeptic_html = (f"<p><b>Outcome:</b> {esc(skeptic.get('outcome'))}"
@@ -365,15 +401,25 @@ def _finding_html(f):
         f'<h4>Interpretation</h4><div class="interpretation">'
         f'{esc(interpretation)}</div>' if interpretation else "")
 
+    interpretation_note_html = (
+        f'<div class="interp"><b>Interpretation (not evidence):</b> '
+        f'{esc(interpretation_note)}</div>'
+        if interpretation_note else "")
+
     fb_options = "".join(
         f'<option value="{esc(o)}">{esc(o) if o else "(select)"}</option>'
         for o in _FEEDBACK_OPTIONS)
 
+    # Build company claim row if present
+    company_claim_row = (
+        f"<table>{_kv_rows([('Company claim', f.get('company_compliance_claim'))])}</table>"
+        if f.get("company_compliance_claim") else "")
+
     return f"""
 <article class="finding" data-fid="{esc(f.get('finding_id'))}" data-verdict="{esc(verdict)}" data-confidence="{esc(confidence)}" data-review="{'true' if review else 'false'}">
-  <div>{"".join(badges)}</div>
+  <div>{"".join(badges)}{claim_badges}{sweep_badge}</div>
   <p><b>Finding ID:</b> {esc(f.get('finding_id'))} &mdash;
-     <b>Row:</b> {esc(f.get('row_id'))} &mdash;
+     <b>Row:</b> {esc(display_id)} &mdash;
      <b>Rule:</b> {esc(f.get('rule_id'))} &mdash;
      <b>Basis:</b> {esc(f.get('basis'))}</p>
   <div class="cols">
@@ -392,6 +438,8 @@ def _finding_html(f):
   </div>
   <h4>Evidence</h4>
   {_observation_html(f.get('observation'))}
+  {company_claim_row}
+  {interpretation_note_html}
   {interpretation_html}
   <h4>Match</h4>
   <p><b>Tier:</b> {esc(match.get('tier'))}</p>
@@ -564,6 +612,7 @@ def render(run_dir):
         _header_html(manifest)
         + _warnings_html(final)
         + _dashboard_html(final)
+        + _triage_html(final)
         + _findings_section_html(final)
         + _leftovers_html(final)
         + _feedback_export_html()

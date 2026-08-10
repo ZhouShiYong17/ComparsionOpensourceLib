@@ -1,5 +1,6 @@
 """Builds every synthetic test file. Deterministic content, no randomness."""
 import csv
+import datetime
 import json
 from pathlib import Path
 
@@ -88,6 +89,8 @@ def build_all(out_dir):
 
     paths["official_xlsx"] = out / "official.xlsx"
     wb = openpyxl.Workbook()
+    wb.properties.created = datetime.datetime(2024, 1, 1)
+    wb.properties.modified = datetime.datetime(2024, 1, 1)
     ws = wb.active
     ws.title = "Rules"
     ws.append(_CSV_COLS)
@@ -111,6 +114,8 @@ def build_all(out_dir):
 
     paths["company_xlsx"] = out / "company.xlsx"
     wb = openpyxl.Workbook()
+    wb.properties.created = datetime.datetime(2024, 1, 1)
+    wb.properties.modified = datetime.datetime(2024, 1, 1)
     ws = wb.active
     ws.title = "Submission"
     ws.append(_HEADERS)

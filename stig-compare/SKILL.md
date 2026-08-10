@@ -48,6 +48,13 @@ failure by inventing content that isn't actually in the evidence you were
 given — fix your answer using only what the request supplied, or leave the
 row for human review.
 
+One designed exception to "never proceed past a non-zero exit code": step 5
+below uses `finalize` exit code `4` (refused — pending matching/semantic
+work) as the retry loop's expected continue signal, not a failure. That
+exception is scoped exactly to that loop and its documented round cap —
+every other non-zero exit code, anywhere in any mode, must still be
+surfaced rather than worked around.
+
 ## Compare mode
 
 1. **Get inputs.** If the user has not already given you exactly two file
@@ -66,7 +73,12 @@ row for human review.
    ```
    A non-zero exit code here means extraction failed (bad file, unreadable
    format, etc.) — surface the error and stop; do not try to patch around
-   it.
+   it. On a genuinely corrupted input file, `start` can also crash with a
+   raw Python traceback instead of a clean exit code (this is a known gap,
+   not something to work around here) — if that happens, report the
+   exception type shown at the bottom of the traceback and stop; do not
+   retry the same file, do not attempt to re-parse or repair it yourself,
+   and do not fabricate extraction results to keep going.
 
 4. **Answer structuring and matching requests, then resolve — repeat while
    there is new work, capped at 2 rounds.** After `start` (and after every
@@ -96,18 +108,49 @@ row for human review.
      an already-answered line is always a safe no-op, so accumulating
      answers across rounds in the same `*_responses.jsonl` file is fine.)
 
-5. **Answer semantic requests.** Once the structuring/matching loop is
-   stable, `runs/<timestamp>/semantic_requests.jsonl` holds every
-   row/rule pair that matched but could not be decided deterministically.
-   For each record, read its `instructions_file` (`prompts/semantic_compare.md`),
-   follow it, and append one JSON object per line to
-   `semantic_responses.jsonl`. If the file doesn't exist, there is nothing
-   to answer — every match in this run was decided deterministically.
+5. **Answer semantic requests — same retry-loop shape as step 4, capped at
+   2 rounds, and never with `--allow-pending` inside the loop.** If
+   `runs/<timestamp>/semantic_requests.jsonl` doesn't exist after step 4,
+   there is nothing to answer — every match in this run was decided
+   deterministically; skip straight to step 6. Otherwise, loop:
+   - For each record in `semantic_requests.jsonl` you have not yet
+     answered (on a second round, that means the newly-appended records
+     carrying `retry: true` / `previous_errors`): read its
+     `instructions_file` (`prompts/semantic_compare.md`), follow it, and
+     append one JSON object per line to `semantic_responses.jsonl`.
+   - Run `python scripts/pipeline.py finalize --run-dir runs/<timestamp> --no-report`
+     — **without** `--allow-pending`.
+     - Exit `0`: every matching/semantic pair now has a real resolution —
+       the two-strike protocol already turns a second bad retry into an
+       honest `Cannot Assess`/`llm-output-rejected` finding automatically,
+       inside this same call, with no need for `--allow-pending`. Stop
+       looping; `final.json` is ready for step 6.
+     - Exit `4` (prints `pending matching=…/pending semantic=…`): this is
+       this loop's designed continue signal (see the hard-rules note
+       above), not a failure. It means at least one pair only has a
+       strike-1 rejection queued for retry so far — check the
+       newly-appended `retry: true` record in `semantic_requests.jsonl`
+       and the new entry in `validation_failures.jsonl` for why. If you
+       are under 2 rounds, go back to the top of this step and answer only
+       the new retry records. **Do not reach for `--allow-pending` here**
+       — doing so before the retry has been given its second chance would
+       silently and permanently sweep an answerable pair into a
+       `semantic-pass-not-run` finding that falsely claims the semantic
+       pass never ran.
+     - Any other non-zero exit must be surfaced per the hard rules — do
+       not loop past it.
+   - If you reach 2 rounds and `finalize --no-report` (still without
+     `--allow-pending`) is still refusing, that means something was never
+     answered at all (not merely retried and rejected twice) — run it once
+     more with `--allow-pending` added (keep `--no-report`) so the
+     genuinely-unanswered pair is honestly marked `*-pass-not-run` /
+     `human_review_needed: true` instead of being left in limbo. This is
+     the only place before step 6 where `--allow-pending` may be used, and
+     only as this last resort after both rounds are exhausted.
 
-6. **Dispatch the skeptical validator, then finalize.**
-   - Run `python scripts/pipeline.py finalize --run-dir runs/<timestamp> --allow-pending`
-     once as a materializing pass. This builds `final.json`, and every
-     finding in it (deterministic or semantic) already carries exactly the
+6. **Dispatch the skeptical validator, then finalize for real.**
+   - The `final.json` produced by step 5's last `finalize` call already
+     has, for every finding (deterministic or semantic), exactly the
      evidence shape `prompts/validator.md` expects: `finding_id`, `row_id`,
      `rule_id`, `verdict` (the claim being tested), `finding_type`,
      `observation`, `company_row` (`original_company_text` +
@@ -132,14 +175,17 @@ row for human review.
      "reason": "..."}`. Append one such JSON object per line to
      `skeptic_responses.jsonl`.
    - Run `python scripts/pipeline.py finalize --run-dir runs/<timestamp> --allow-pending`
-     a second time. Because skeptic responses are also fingerprinted, this
-     is safe to call again — it merges the skeptic outcomes (`disputed`,
-     `skeptic.outcome`/`skeptic.reason`) into the findings, recomputes
-     `confidence`/`human_review_needed`, and regenerates `report.html`.
-     A non-zero exit code (e.g. exit 4 if `--allow-pending` were omitted
-     and matching/semantic requests are still outstanding, or exit 3 if
-     coverage accounting doesn't add up) must be surfaced, not silently
-     retried past.
+     **one final time — this is the only `finalize` call in the whole
+     compare-mode flow that omits `--no-report`, and the only one that
+     unconditionally carries `--allow-pending`.** By this point step 5 has
+     already given every matching/semantic retry its full 2 rounds, so
+     `--allow-pending` here cannot prematurely sweep anything answerable —
+     it only (a) merges the skeptic outcomes (`disputed`,
+     `skeptic.outcome`/`skeptic.reason`) into the findings, (b) recomputes
+     `confidence`/`human_review_needed`, and (c) renders `report.html`.
+     Because responses are fingerprinted, calling `finalize` again here is
+     always safe. A non-zero exit code (e.g. exit 3 if coverage accounting
+     doesn't add up) must still be surfaced, not silently retried past.
 
 7. **Present the results.** Report, in this order:
    1. Warnings — everything in `final.json["warnings"]` (extraction

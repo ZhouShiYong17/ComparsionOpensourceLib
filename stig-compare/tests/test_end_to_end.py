@@ -3,8 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.build_fixtures import build_all
+from fixtures.build_fixtures import build_all, _write_docx, _HEADERS
 import common
+import compare_values
 import pipeline
 
 
@@ -95,3 +96,111 @@ def test_full_run_identical_content_no_false_positives(tmp_path):
     final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
     row1 = [f for f in final["findings"] if f["rule_id"] == "V-1001"]
     assert all(f["verdict"] != "Non-Compliant" for f in row1)
+
+
+def test_semantic_retry_not_swept_by_allow_pending(tmp_path):
+    """A semantic response that fails validation on strike 1 must get its
+    documented retry chance via `finalize` (no --allow-pending) refusing
+    with exit 4 -- it must NOT be immediately swept into a permanent,
+    falsely-labeled "semantic-pass-not-run" finding just because
+    --allow-pending happens to be set on that call. This guards the
+    SKILL.md-documented compare-mode flow (step 5's retry loop must run
+    to completion, without --allow-pending, before any pending semantic
+    pair may legitimately be treated as unanswerable)."""
+    fx = build_all(tmp_path / "fx")
+
+    # One company row that MATCHES V-1003 (audit logging) lexically, but
+    # whose observed value is unparseable, so the deterministic value
+    # comparison can't decide it and it must hand off to the semantic pass.
+    row = ["High", "Audit logging must be enabled",
+           "Database audit logging requirement",
+           "Review audit configuration", "enabled",
+           "see attached screenshot evidence"]
+    company_path = tmp_path / "fx" / "company_semantic.docx"
+    _write_docx(company_path, _HEADERS, [row])
+
+    # Sanity check: this pairing really is semantic-only (deterministic
+    # value comparison must return None), matching the row's real shape
+    # after extraction (context_grouping/description/objective/command/
+    # approved/observed, in the order _HEADERS maps them).
+    official = json.loads(fx["official_json"].read_text(encoding="utf-8"))
+    v1003 = next(r for r in official if r["rule_id"] == "V-1003")
+    company_row = {
+        "context_grouping": row[0],
+        "stig_objective_or_requirement": row[1],
+        "stig_description": row[2],
+        "stig_command_or_value": row[3],
+        "company_approved_setting_or_expected_value": row[4],
+        "observed_value_or_evidence": row[5],
+    }
+    assert compare_values.deterministic_verdict(company_row, v1003) is None
+
+    run_dir = tmp_path / "run3"
+    assert pipeline.main(["start", "--official", str(fx["official_csv"]),
+                          "--company", str(company_path),
+                          "--run-dir", str(run_dir)]) == 0
+
+    reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    assert len(reqs) == 1
+    row_id = reqs[0]["row_id"]
+    common.write_jsonl(run_dir / "matching_responses.jsonl", [{
+        "row_id": row_id, "decision": "match", "rule_id": "V-1003",
+        "ambiguous_rule_ids": [],
+        "row_quote": "Audit logging must be enabled",
+        "rule_quote": "Audit logging must be enabled",
+        "basis": "direct requirement match"}])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+    sem_reqs = common.read_jsonl(run_dir / "semantic_requests.jsonl")
+    assert len(sem_reqs) == 1
+    sreq = sem_reqs[0]
+    assert sreq["row_id"] == row_id and sreq["rule_id"] == "V-1003"
+
+    # Strike 1: an invalid semantic response (empty quotes -> rejected by
+    # validate.validate_semantic_output).
+    responses = [{"row_id": sreq["row_id"], "rule_id": sreq["rule_id"],
+                 "finding_type": "cannot-determine", "verdict": "Cannot Assess",
+                 "row_quote": "", "rule_quote": "", "interpretation": "n/a"}]
+    common.write_jsonl(run_dir / "semantic_responses.jsonl", responses)
+
+    # finalize WITHOUT --allow-pending must refuse (exit 4), not sweep the
+    # still-retriable pair into a finding.
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir), "--no-report"])
+    assert rc == 4
+
+    final_path = run_dir / "final.json"
+    assert not final_path.exists()
+
+    # The retry must have been queued, not discarded, and the strike-1
+    # rejection must be on the audit trail.
+    sem_reqs2 = common.read_jsonl(run_dir / "semantic_requests.jsonl")
+    retry_reqs = [r for r in sem_reqs2 if r.get("retry")]
+    assert len(retry_reqs) == 1
+    assert retry_reqs[0]["row_id"] == row_id and retry_reqs[0]["rule_id"] == "V-1003"
+
+    vfails = common.read_jsonl(run_dir / "validation_failures.jsonl")
+    assert any(v["kind"] == "semantic" and v["row_id"] == row_id
+               for v in vfails)
+
+    # Strike 2 (the retry): a valid semantic response this time.
+    responses.append({"row_id": sreq["row_id"], "rule_id": sreq["rule_id"],
+                      "finding_type": "weaker", "verdict": "Cannot Assess",
+                      "row_quote": "see attached screenshot evidence",
+                      "rule_quote": "Audit logging must be enabled",
+                      "interpretation": "evidence references an external "
+                                        "artifact, not a verifiable value"})
+    common.write_jsonl(run_dir / "semantic_responses.jsonl", responses)
+
+    # No pending work remains once the retry is answered -- --allow-pending
+    # is not needed here.
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir)])
+    assert rc == 0
+
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    findings = [f for f in final["findings"] if f["rule_id"] == "V-1003"]
+    assert len(findings) == 1
+    f = findings[0]
+    assert f["finding_type"] == "weaker"
+    assert f["verdict"] == "Cannot Assess"
+    assert f["basis"] == "semantic-comparison"
+    assert f["basis"] != "semantic-pass-not-run"

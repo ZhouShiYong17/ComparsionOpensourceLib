@@ -18,45 +18,47 @@ flowchart TB
     end
 
     subgraph core [Deterministic core — Python, replayable]
-        S1["1 · extract.py<br/>provenance + stable row IDs;<br/>unmapped headers & merged cells degrade visibly"]
-        S2["2 · normalize.py<br/>additive normalization — raw text always kept"]
-        S3["3 · candidates.py<br/>T0 exact ID · T1 technical signature (no LLM) ·<br/>top-5 shortlist for the rest"]
-        S4["4 · pipeline.py resolve<br/>applies only validated fields;<br/>near-ties become ambiguous, never forced"]
-        S5["5 · compare_values.py<br/>deterministic verdicts;<br/>no observed evidence ⇒ Cannot Assess"]
-        S6["6 · pipeline.py finalize<br/>merges skeptic outcomes · confidence class · review flags"]
-        S7["7 · coverage.py<br/>every row in exactly one bucket;<br/>sums must match or the run fails loudly"]
-        S8["8 · report.py<br/>final.json → report.html — one offline file, warnings first"]
+        S1["1 · extract.py + skeleton.py<br/>official rules parsed with provenance;<br/>company doc dumped losslessly — zero interpretation"]
+        S2["2 · table-mapping pass<br/>Claude triages every table & proposes a column mapping;<br/>resolve applies only validated mappings"]
+        S3["3 · canonicalize pass<br/>Claude turns mapped rows into canonical records;<br/>every row accounted for or mechanically rejected"]
+        S4["4 · normalize.py<br/>additive normalization — raw text always kept"]
+        S5["5 · candidates.py<br/>T0 exact ID · T1 technical signature (no LLM) ·<br/>top-5 shortlist for the rest"]
+        S6["6 · matching pass + one sweep round<br/>Claude adjudicates the shortlist (multi-select);<br/>sweep gives leftovers one more deterministic look"]
+        S7["7 · compare_values.py<br/>deterministic verdicts;<br/>no observed evidence ⇒ Cannot Assess"]
+        S8["8 · pipeline.py finalize<br/>semantic pass · merges skeptic outcomes ·<br/>confidence class · review flags"]
+        S9["9 · coverage.py + report.py<br/>every row in exactly one bucket, incl. table triage;<br/>final.json → report.html, warnings first"]
     end
 
     subgraph claude [Claude — untrusted until verified]
-        C1["Claude passes (prompts/*.md)<br/>structure messy rows · adjudicate shortlist ·<br/>semantic verdicts<br/><i>none / ambiguous always acceptable</i>"]
+        C1["Claude passes (prompts/*.md)<br/>table-map · canonicalize · adjudicate shortlist ·<br/>sweep · semantic verdicts<br/><i>none / ambiguous always acceptable</i>"]
         C2["Skeptic subagent (validator.md)<br/>isolated — mandate: try to disprove"]
     end
 
     A --> S1
     B --> S1
-    S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8 --> S9
 
-    S3 -- "*_requests.jsonl" --> C1
-    C1 -- "*_responses.jsonl<br/>⛨ validate.py firewall: quotes must exist verbatim ·<br/>shortlist-only · 2 strikes then rejection" --> S4
-    S6 -- "finding + raw evidence only" --> C2
-    C2 -- "upheld · refuted ⇒ shown as disputed" --> S6
+    core -- "table_mapping_requests.jsonl · canonicalize_requests.jsonl ·<br/>matching_requests.jsonl · sweep_requests.jsonl ·<br/>semantic_requests.jsonl" --> claude
+    claude -- "*_responses.jsonl<br/>⛨ validate.py firewall: quotes must exist verbatim ·<br/>shortlist/pending-only · 2 strikes then rejection" --> core
+    S8 -- "finding + raw evidence only" --> C2
+    C2 -- "upheld · refuted ⇒ shown as disputed" --> S8
 ```
 
-Everything in the deterministic core writes JSON artifacts to `runs/<run-id>/` and can be replayed. Claude only ever sees narrow, pre-screened requests — and every response must cross the **evidence firewall**: quotes are checked to literally exist in the source documents, match answers may only reference the presented shortlist, and a response that fails twice is rejected with a visible audit entry.
+Everything in the deterministic core writes JSON artifacts to `runs/<run-id>/` and can be replayed. Claude only ever sees narrow, pre-screened requests — and every response must cross the **evidence firewall**: quotes are checked to literally exist in the source documents, match answers may only reference the presented shortlist, and a response that fails twice is rejected with a visible audit entry. (The retired single-pass company extractor — `extract_company`, its `structuring_requests.jsonl`/`structuring_responses.jsonl`, and `prompts/structuring.md` — has been removed; company extraction now always goes through the table-mapping and canonicalize passes above.)
 
 ---
 
 ## 2. What each stage does
 
-1. **Extract.** Both files are parsed into rows and rules with full provenance (table, row, sheet) and stable hashed IDs, so the same file always yields the same IDs. Messy content is never silently guessed: unmappable columns are flagged for structuring, merged cells and unreadable rows are marked and counted.
-2. **Normalize.** Whitespace, casing, Unicode and number formats are canonicalized for comparison — additively. The raw text is always preserved, so the report can distinguish a formatting-only difference from a real one.
-3. **Match candidates.** An explicit STIG ID (rare) matches instantly (T0). A unique technical fingerprint — a command or parameter name like `password_reuse_max` — matches deterministically with no LLM involved (T1). Everything else gets a scored top-5 shortlist with the per-feature score breakdown preserved, so the report can show *why* a match was proposed. Group headings like "Password" are only a tie-breaker — never proof.
-4. **Resolve.** Claude's structuring and matching answers are applied only after validation. When two candidate rules are both plausible, the row is reported as *ambiguous* with both shown — a wrong match is treated as worse than no match.
-5. **Deterministic verdicts.** Wherever both sides parse as values ("9" vs "9 or more", "60 days or less", enabled/disabled), code computes Compliant / Non-Compliant — Claude is not consulted. One rule is unoverridable: a row with no observed evidence is **Cannot Assess**, full stop.
-6. **Finalize.** Semantic verdicts return through the firewall; an isolated skeptic subagent then tries to *disprove* each one. Refuted findings are shown as disputed with both positions — never dropped. Confidence is a class with criteria (High / Medium / Low), not a made-up score, and a separate flag marks anything needing human review.
-7. **Coverage.** Pure arithmetic: every submission row is matched, ambiguous, unmatched, unresolved, or failed — and the buckets must sum exactly. More than 10% not compared triggers a red banner. An incomplete comparison cannot look like a complete one.
-8. **Report.** One HTML file: run metadata with file hashes and component versions, warnings first (never collapsible), a verdict dashboard, side-by-side findings with verbatim quotes, and dedicated sections for the leftovers — ambiguous matches, unmatched rows, official rules nobody addressed.
+1. **Extract & skeleton.** The official file is parsed into rules with full provenance and stable hashed IDs (`extract.py`). The company file is dumped losslessly into tables and rows with zero interpretation (`skeleton.py`) — nothing is guessed, mapped, or dropped at this stage; that all happens in the two Claude passes below.
+2. **Table-mapping pass.** Claude triages every table — `stig_relevant`, `irrelevant`, or `uncertain` — and proposes a column mapping (`table_mapping_requests.jsonl` / `table_mapping_responses.jsonl`). `resolve` applies only validated mappings; a table that fails validation twice is marked `mapping-failed` rather than guessed at.
+3. **Canonicalize pass.** For every mapped table, Claude turns each row into one or more canonical records — or marks it a separator/continuation (`canonicalize_requests.jsonl` / `canonicalize_responses.jsonl`). Every row must be accounted for exactly once; a response that loses or duplicates a row is rejected mechanically.
+4. **Normalize.** Whitespace, casing, Unicode and number formats are canonicalized for comparison — additively. The raw text is always preserved, so the report can distinguish a formatting-only difference from a real one.
+5. **Match candidates.** An explicit STIG ID (rare) matches instantly (T0). A unique technical fingerprint — a command or parameter name like `password_reuse_max` — matches deterministically with no LLM involved (T1). Everything else gets a scored top-5 shortlist with the per-feature score breakdown preserved, so the report can show *why* a match was proposed. Group headings like "Password" are only a tie-breaker — never proof.
+6. **Matching pass, then one sweep round.** Claude adjudicates the shortlist — multi-select, since one record can genuinely satisfy several rules — and `resolve` applies only validated answers (`matching_requests.jsonl` / `matching_responses.jsonl`). A single deterministic sweep (`sweep_requests.jsonl` / `sweep_responses.jsonl`) then gives anything still unmatched one more look against the still-unaddressed rules; its proposals feed back through the same matching adjudication, and the sweep itself never repeats.
+7. **Deterministic verdicts.** Wherever both sides parse as values ("9" vs "9 or more", "60 days or less", enabled/disabled), code computes Compliant / Non-Compliant — Claude is not consulted. One rule is unoverridable: a record with no observed evidence is **Cannot Assess**, full stop.
+8. **Finalize.** Everything code couldn't decide goes through a semantic pass (`semantic_requests.jsonl` / `semantic_responses.jsonl`), validated through the same firewall; an isolated skeptic subagent then tries to *disprove* each semantic finding. Refuted findings are shown as disputed with both positions — never dropped. Confidence is a class with criteria (High / Medium / Low), not a made-up score, and a separate flag marks anything needing human review.
+9. **Coverage & report.** Coverage is pure arithmetic: every submission row lands in exactly one bucket — matched, ambiguous, unmatched, ignored by an irrelevant table, or extraction-failed — and the buckets must sum exactly. More than 10% not compared triggers a red banner. The report is one HTML file: run metadata with file hashes and component versions, warnings first (never collapsible), a verdict dashboard with a table-triage panel, side-by-side findings with verbatim quotes, and dedicated sections for the leftovers — ambiguous matches, unmatched rows, official rules nobody addressed.
 
 ---
 
@@ -85,7 +87,7 @@ Three modes, all driven conversationally from Claude Code in this repository.
 ### Mode 1 — Run a comparison
 
 - **You say:** *"Use stig-compare to check `team_submission.docx` against `official_stig.csv`."*
-- **What happens:** Claude runs the pipeline, answers the structuring / matching / semantic passes under the firewall, dispatches the skeptic, and finalizes. Anything it cannot resolve stays visible as pending or unmatched — never silently dropped.
+- **What happens:** Claude runs the pipeline, answers the table-mapping / canonicalize / matching / sweep / semantic passes under the firewall, dispatches the skeptic, and finalizes. Anything it cannot resolve stays visible as pending or unmatched — never silently dropped.
 - **You get:** `runs/<timestamp>/report.html` — double-click to open in any browser; it works from disk, offline. Read it top-down: warnings, then the dashboard, then the findings flagged for review.
 
 ### Mode 2 — Give feedback on a finding

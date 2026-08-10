@@ -65,6 +65,6 @@ One record from `semantic_requests.jsonl`:
   relevant fragment — e.g. the record field text that fails to supply the
   needed evidence, and the rule's `expected_value`/`check_text` fragment
   it fails to satisfy. An empty quote is rejected unconditionally; `""`
-  is never a valid answer here (unlike the structuring prompt's fields).
+  is never a valid answer here.
 - `interpretation` is the ONLY field for your reasoning and conclusions.
   Keep `row_quote`/`rule_quote` limited to what the texts literally say.

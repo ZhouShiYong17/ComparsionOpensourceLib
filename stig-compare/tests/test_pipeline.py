@@ -885,6 +885,122 @@ def test_skeptic_merge_disputes_finding_and_records_bad_responses(tmp_path):
     assert any("no-such-request" in f["errors"] for f in skeptic_failures)
 
 
+# --------------------------------------------------------------------------
+# Task 17 review: semantic strike-1-retry regression guard. The old
+# test_end_to_end.py::test_semantic_retry_not_swept_by_allow_pending had no
+# equivalent under the new record_id-based schema after Task 17's e2e
+# rewrite -- rebuilt here against the current pipeline.
+# --------------------------------------------------------------------------
+
+def test_semantic_strike1_retry_not_swept_by_allow_pending(tmp_path):
+    """A semantic response that fails validation on strike 1 must get its
+    documented retry chance via `finalize` (no --allow-pending) refusing
+    with exit 4 -- it must NOT be immediately, silently swept into a
+    permanent, falsely-labeled "semantic-pass-not-run"/"llm-output-rejected"
+    finding just because a still-pending pair happens to look answerable.
+    This guards the SKILL.md-documented compare-mode flow (step 8's retry
+    loop must run to completion, without --allow-pending, before any
+    pending semantic pair may legitimately be treated as unanswerable)."""
+    official_path = tmp_path / "official_semretry.csv"
+    _write_official_csv(official_path, [
+        {"rule_id": "V-7001", "title": "Audit logging must be enabled",
+         "severity": "high",
+         "check_text": "Verify audit logging is enabled for all systems",
+         "fix_text": "Enable audit logging", "expected_value": "enabled"}])
+    headers = ["Requirement", "Description", "Command", "Approved Setting",
+              "Observed"]
+    rows = [["Audit logging must be enabled", "Ensure audit trail captured",
+            "Verify audit logging is enabled for all systems", "enabled",
+            "see attached evidence"]]
+    company_path = tmp_path / "company_semretry.docx"
+    _write_docx(company_path, headers, rows)
+
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start", "--official", str(official_path),
+                          "--company", str(company_path),
+                          "--run-dir", str(run_dir)]) == 0
+
+    mreqs = common.read_jsonl(run_dir / "table_mapping_requests.jsonl")
+    mapping = {"0": "stig_objective_or_requirement", "1": "stig_description",
+              "2": "stig_command_or_value",
+              "3": "company_approved_setting_or_expected_value",
+              "4": "observed_value_or_evidence"}
+    common.write_jsonl(run_dir / "table_mapping_responses.jsonl",
+                       [_mapping_answer(mreqs[0], mapping=mapping)])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    canon_reqs = common.read_jsonl(run_dir / "canonicalize_requests.jsonl")
+    common.write_jsonl(run_dir / "canonicalize_responses.jsonl",
+                       [_canon_answer(r) for r in canon_reqs])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+    m_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    assert len(m_reqs) == 1
+    common.write_jsonl(run_dir / "matching_responses.jsonl",
+                       [_match_answer(m_reqs[0], ["V-7001"])])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+    sem_reqs = common.read_jsonl(run_dir / "semantic_requests.jsonl")
+    assert len(sem_reqs) == 1                  # non-numeric -> semantic path
+    sreq = sem_reqs[0]
+
+    # Strike 1: an invalid semantic response -- row_quote is fabricated, not
+    # a verbatim substring of the record's original_company_text, so it is
+    # rejected by validate.validate_semantic_output.
+    responses = [{"record_id": sreq["record_id"], "rule_id": sreq["rule_id"],
+                 "finding_type": "cannot-determine", "verdict": "Cannot Assess",
+                 "row_quote": "this exact phrase never appears in the row",
+                 "rule_quote": "Verify audit logging is enabled for all systems",
+                 "interpretation": "n/a"}]
+    common.write_jsonl(run_dir / "semantic_responses.jsonl", responses)
+
+    # finalize WITHOUT --allow-pending must refuse (exit 4), not sweep the
+    # still-retriable pair into a finding.
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir), "--no-report"])
+    assert rc == 4
+
+    final_path = run_dir / "final.json"
+    assert not final_path.exists()
+
+    # The retry must have been queued, not discarded, and the strike-1
+    # rejection must be on the audit trail.
+    sem_reqs2 = common.read_jsonl(run_dir / "semantic_requests.jsonl")
+    retry_reqs = [r for r in sem_reqs2 if r.get("retry")]
+    assert len(retry_reqs) == 1
+    assert retry_reqs[0]["record_id"] == sreq["record_id"]
+    assert retry_reqs[0]["rule_id"] == sreq["rule_id"]
+    assert "previous_errors" in retry_reqs[0]
+    assert retry_reqs[0]["previous_errors"]
+
+    vfails = common.read_jsonl(run_dir / "validation_failures.jsonl")
+    assert any(v["kind"] == "semantic" and v["row_id"] == sreq["record_id"]
+               for v in vfails)
+
+    # Strike 2 (the retry): a valid semantic response this time.
+    responses.append({"record_id": sreq["record_id"], "rule_id": sreq["rule_id"],
+                      "finding_type": "weaker", "verdict": "Cannot Assess",
+                      "row_quote": "see attached evidence",
+                      "rule_quote": "Verify audit logging is enabled for all "
+                                    "systems",
+                      "interpretation": "evidence references an external "
+                                        "artifact, not a verifiable value"})
+    common.write_jsonl(run_dir / "semantic_responses.jsonl", responses)
+
+    # No pending work remains once the retry is answered -- --allow-pending
+    # is not needed here.
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir), "--no-report"])
+    assert rc == 0
+
+    final = json.loads(final_path.read_text(encoding="utf-8"))
+    findings = [f for f in final["findings"] if f["rule_id"] == "V-7001"]
+    assert len(findings) == 1
+    f = findings[0]
+    assert f["finding_type"] == "weaker"
+    assert f["verdict"] == "Cannot Assess"
+    assert f["basis"] == "semantic-comparison"
+    assert f["basis"] != "semantic-pass-not-run"
+    assert f["basis"] != "llm-output-rejected"
+
+
 def _read_jsonl_or_empty(path):
     return common.read_jsonl(path) if path.exists() else []
 

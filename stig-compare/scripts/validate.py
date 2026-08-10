@@ -1,5 +1,6 @@
 """Deterministic validation. Claude output is untrusted input (spec section 5)."""
 import common
+import canonical
 
 FINDING_TYPES = {"equivalent", "stronger", "weaker", "changed-scope",
                  "contradictory", "cannot-determine"}
@@ -97,3 +98,120 @@ def find_contradictions(findings):
             out.append({"finding_ids": [f["finding_id"] for f in fs],
                         "code": "contradictory-verdicts"})
     return out
+
+
+def validate_table_mapping_output(resp, table):
+    errs = _require(resp, ["table_index", "classification",
+                           "irrelevant_reason", "column_mapping",
+                           "context_grouping"])
+    if errs:
+        return errs
+    if resp["table_index"] != table["table_index"]:
+        return ["wrong-table-index"]
+    cls = resp["classification"]
+    if cls not in canonical.TABLE_CLASSIFICATIONS:
+        return ["bad-classification"]
+    if cls == "irrelevant" and \
+            resp["irrelevant_reason"] not in canonical.IRRELEVANT_REASONS:
+        errs.append("bad-irrelevant-reason")
+    cm = resp["column_mapping"]
+    if not isinstance(cm, dict):
+        return errs + ["bad-column-mapping"]
+    ncols = max(len(table["header_row"]),
+                max((len(r["cells"]) for r in table["rows"]), default=0))
+    seen_fields = set()
+    for k, v in cm.items():
+        if not (isinstance(k, str) and k.isdigit() and int(k) < ncols):
+            errs.append("bad-column-index")
+            break
+        if v not in canonical.MAPPING_TARGETS:
+            errs.append("bad-mapping-target")
+            break
+        if v in canonical.CANONICAL_DATA_FIELDS:
+            if v in seen_fields:
+                errs.append("duplicate-field-mapping")
+                break
+            seen_fields.add(v)
+    if cls in ("stig_relevant", "uncertain") and not errs and not seen_fields:
+        errs.append("no-canonical-columns")
+    cg = resp["context_grouping"]
+    if not isinstance(cg, str):
+        errs.append("bad-context-grouping")
+    elif common.fold_ws(cg):
+        context_src = " ".join(
+            [table.get("preceding_narrative", ""),
+             table.get("sheet_or_section", "")] +
+            [str(h) for h in table.get("header_row", [])])
+        if not quote_exists(cg, context_src):
+            errs.append("context-grouping-not-verbatim")
+    return errs
+
+
+def _validate_canon_record(rec, row_index, cells_by_index):
+    if not isinstance(rec, dict):
+        return [f"bad-record:{row_index}"]
+    fields = rec.get("fields")
+    prov = rec.get("field_provenance")
+    note = rec.get("interpretation_note", "")
+    if not isinstance(fields, dict) or not isinstance(prov, dict) or \
+            not isinstance(note, str):
+        return [f"bad-record:{row_index}"]
+    for name, value in fields.items():
+        if name not in canonical.CANONICAL_DATA_FIELDS:
+            return [f"unknown-field:{name}"]
+        if not isinstance(value, str):
+            return [f"bad-field-type:{name}"]
+        if not common.fold_ws(value):
+            continue
+        p = prov.get(name)
+        if not (isinstance(p, dict) and isinstance(p.get("row_index"), int)
+                and isinstance(p.get("cell_index"), int)):
+            return [f"missing-provenance:{name}"]
+        cells = cells_by_index.get(p["row_index"])
+        if cells is None or not (0 <= p["cell_index"] < len(cells)):
+            return [f"bad-provenance:{name}"]
+        if not quote_exists(value, cells[p["cell_index"]]):
+            return [f"not-cell-verbatim:{name}"]
+    return []
+
+
+def validate_canonicalize_output(resp, table, chunk_row_indexes):
+    errs = _require(resp, ["chunk_id", "rows"])
+    if errs:
+        return errs
+    rows = resp["rows"]
+    if not isinstance(rows, list):
+        return ["bad-rows"]
+    cells_by_index = {r["row_index"]: r["cells"] for r in table["rows"]}
+    chunk_set = set(chunk_row_indexes)
+    seen = set()
+    for entry in rows:
+        if not isinstance(entry, dict):
+            return ["bad-row-entry"]
+        ri = entry.get("row_index")
+        if ri not in chunk_set or ri in seen:
+            return ["bad-row-index"]
+        seen.add(ri)
+        disp = entry.get("disposition")
+        if disp not in canonical.DISPOSITIONS:
+            return ["bad-disposition"]
+        if disp == "separator":
+            st = entry.get("separator_text", "")
+            if not isinstance(st, str):
+                return [f"bad-separator:{ri}"]
+            if common.fold_ws(st) and not quote_exists(
+                    st, canonical.original_text(cells_by_index[ri])):
+                return [f"separator-not-verbatim:{ri}"]
+        if disp == "record":
+            recs = entry.get("records")
+            if not isinstance(recs, list) or not recs:
+                return [f"missing-records:{ri}"]
+            for pos, rec in enumerate(recs):
+                if not isinstance(rec, dict) or rec.get("sub_index") != pos:
+                    return [f"bad-sub-index:{ri}"]
+                rerrs = _validate_canon_record(rec, ri, cells_by_index)
+                if rerrs:
+                    return rerrs
+    if seen != chunk_set:
+        return [f"missing-rows:{len(chunk_set - seen)}"]
+    return []

@@ -2,8 +2,9 @@ import normalize
 
 
 def test_norm_text_folds_case_space_unicode():
-    assert normalize.norm_text("  Ена́bled  VALUE ") == \
-           normalize.norm_text("Ена́bled value")
+    composed = "Café  VALUE"            # Ã© precomposed (U+00E9)
+    decomposed = "café value"           # e + U+0301 combining acute
+    assert normalize.norm_text(composed) == normalize.norm_text(decomposed)
 
 
 def test_norm_value_numbers_and_quotes():
@@ -21,7 +22,7 @@ def test_add_normalized_is_additive_not_destructive():
 
 
 def test_meaning_preserved_distinct_values_stay_distinct():
-    # normalization must never merge meaningfully different values (spec §4.4)
+    # normalization must never merge meaningfully different values (spec Â§4.4)
     pairs = [("9 or more", "9"), ("enabled", "disabled"),
              ("60 days", "90 days"), ("15 minutes", "15 hours")]
     for a, b in pairs:

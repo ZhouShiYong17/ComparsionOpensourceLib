@@ -9,7 +9,9 @@ import extract
 def data(tmp_path_factory):
     fx = build_all(tmp_path_factory.mktemp("fx"))
     official = extract.extract_official(fx["official_csv"])["records"]
-    company = extract.extract_company(fx["company_docx"])["records"]
+    company_raw = extract.extract_company(fx["company_docx"])["records"]
+    # Transform row_id to record_id for canonical record interface
+    company = [dict(r, record_id=r.pop("row_id")) for r in company_raw]
     return official, company
 
 
@@ -38,7 +40,7 @@ def test_all_caps_stopword_gives_no_t1_match_or_technical_score():
                 "severity": "low",
                 "check_text": "Run SHOW to inspect the banner setting.",
                 "fix_text": "No fix needed.", "expected_value": ""}]
-    row = {"row_id": "R-shoutcap1", "status": "ok", "context_grouping": "",
+    row = {"record_id": "R-shoutcap1", "status": "ok", "context_grouping": "",
           "stig_description": "", "stig_objective_or_requirement": "",
           "stig_command_or_value": "",
           "company_approved_setting_or_expected_value": "",
@@ -46,11 +48,19 @@ def test_all_caps_stopword_gives_no_t1_match_or_technical_score():
           "original_company_text": "Admin must SHOW the current banner text"}
     results = candidates.generate([row], official)
     assert results[0]["tier"] is None
-    assert results[0]["matched_rule_id"] is None
+    assert results[0]["matched_rule_ids"] == []
 
     idf = candidates.build_idf(official)
     scored = candidates.score_row(row, official[0], idf)
     assert scored["features"]["technical"] == 0.0
+
+
+def test_non_ok_records_are_skipped(data):
+    official, _ = data
+    row = {"record_id": "CR-x", "status": "extraction-failed",
+           "original_company_text": "Run SHOW PARAMETER password_reuse_max",
+           "context_grouping": ""}
+    assert candidates.generate([row], official) == []
 
 
 def test_t1_unique_technical_signature(data):
@@ -58,7 +68,7 @@ def test_t1_unique_technical_signature(data):
     results = candidates.generate(company, official)
     r1 = results[0]                          # password-reuse row
     assert r1["tier"] == "T1"
-    assert r1["matched_rule_id"] == "V-1001"
+    assert r1["matched_rule_ids"] == ["V-1001"]
 
 
 def test_shortlist_recall_for_paraphrased_row(data):
@@ -76,7 +86,7 @@ def test_no_plausible_candidate_gives_empty_list(data):
     results = candidates.generate(company, official)
     r4 = results[3]                          # screensaver row matches nothing
     assert r4["tier"] is None
-    assert r4["matched_rule_id"] is None
+    assert r4["matched_rule_ids"] == []
     assert r4["candidates"] == []            # -> T4 unmatched downstream
 
 
@@ -86,12 +96,12 @@ def test_t0_exact_id_wins(data):
     row["original_company_text"] += " (ref V-1005)"
     results = candidates.generate([row], official)
     assert results[0]["tier"] == "T0"
-    assert results[0]["matched_rule_id"] == "V-1005"
+    assert results[0]["matched_rule_ids"] == ["V-1005"]
 
 
 def test_severity_alone_never_creates_candidate(data):
     official, _ = data
-    row = {"row_id": "R-test0001", "status": "ok", "context_grouping": "High",
+    row = {"record_id": "R-test0001", "status": "ok", "context_grouping": "High",
            "stig_description": "", "stig_objective_or_requirement": "",
            "stig_command_or_value": "",
            "company_approved_setting_or_expected_value": "",
@@ -106,7 +116,7 @@ def test_paraphrased_row_with_token_overlap_only(data):
     # no value overlap, non-matching severity) must still appear in shortlist.
     # This tests the recall mechanism that stopword filtering must preserve.
     official, _ = data
-    row = {"row_id": "R-test0002", "status": "ok", "context_grouping": "High",
+    row = {"record_id": "R-test0002", "status": "ok", "context_grouping": "High",
            "stig_description": "User sessions should terminate after idle time",
            "stig_objective_or_requirement": "User sessions must end after a short period of inactivity",
            "stig_command_or_value": "Check session timeout settings",

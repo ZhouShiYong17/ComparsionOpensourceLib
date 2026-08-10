@@ -1,4 +1,4 @@
-"""Lexical candidate generation and deterministic match tiers T0/T1.
+"""Scores canonical company records against official rules for deterministic match tiers T0/T1.
 
 Explainable features only; severity can only break ties (spec section 4.5-4.6).
 Stopwords (common function words and instruction verbs) are excluded from
@@ -109,7 +109,7 @@ def generate(company_rows, official_rules, k=5, floor=0.05, margin=0.15):
                  for r in official_rules}
     results = []
     for row in company_rows:
-        if row.get("status") not in ("ok", "needs-structuring"):
+        if row.get("status") != "ok":
             continue
         scored = sorted(
             ({"rule_id": r["rule_id"], **score_row(row, r, idf)}
@@ -122,21 +122,21 @@ def generate(company_rows, official_rules, k=5, floor=0.05, margin=0.15):
                      c["score"] > _WEIGHTS["severity_tiebreak"] *
                      c["features"]["severity_tiebreak"] + 1e-9][:k]
 
-        result = {"row_id": row["row_id"], "tier": None,
-                  "matched_rule_id": None, "margin_flag": False,
+        result = {"record_id": row["record_id"], "tier": None,
+                  "matched_rule_ids": [], "margin_flag": False,
                   "candidates": shortlist}
 
         m = _ID.search(row["original_company_text"] or "")
         if m and m.group(0).upper() in by_id:
             result["tier"] = "T0"
-            result["matched_rule_id"] = m.group(0).upper()
+            result["matched_rule_ids"] = [m.group(0).upper()]
         else:
             row_tech = technical_tokens(row["original_company_text"])
             if row_tech:
                 hits = [rid for rid, toks in rule_tech.items() if row_tech & toks]
                 if len(hits) == 1:
                     result["tier"] = "T1"
-                    result["matched_rule_id"] = hits[0]
+                    result["matched_rule_ids"] = [hits[0]]
 
         if result["tier"] is None and len(shortlist) >= 2 and shortlist[0]["score"] > 0:
             rel = (shortlist[0]["score"] - shortlist[1]["score"]) / shortlist[0]["score"]

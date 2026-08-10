@@ -175,7 +175,10 @@ surfaced rather than worked around.
 8. **Answer semantic requests, then dispatch the skeptic and finalize for
    real.** If `runs/<timestamp>/semantic_requests.jsonl` doesn't exist at
    this point, every match in this run was decided deterministically —
-   skip straight to the skeptic dispatch below. Otherwise:
+   run `python scripts/pipeline.py finalize --run-dir runs/<timestamp> --no-report`
+   once (it should exit `0`, since there is nothing pending to answer) to
+   produce `final.json`, then skip straight to the skeptic dispatch below.
+   Otherwise:
    - **Semantic loop — same retry-loop shape as steps 4–6, capped at 2
      rounds, and never with `--allow-pending` inside the loop:**
      - For each record in `semantic_requests.jsonl` you have not yet

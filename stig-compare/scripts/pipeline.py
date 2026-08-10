@@ -541,6 +541,35 @@ def cmd_resolve(args):
                 return ts, ts["chunks"][chunk_id]
         return None, None
 
+    def _canon_retry_request(cid, ts, table, chunk):
+        """Look up (or reconstruct) the request to retry for `cid`.
+
+        canon_req_by_id is loaded from canonicalize_requests.jsonl on disk
+        *before* the table-mapping pass above appends newly created chunk
+        requests to new_canon_requests -- those are only persisted to that
+        file at the end of this call (_append_jsonl(..., new_canon_requests)
+        below). So a response answering a chunk created earlier in this same
+        resolve call (chunk ids are predictable, e.g. "T3-C0") has no entry
+        in canon_req_by_id yet. Reconstruct the same request shape from the
+        table/table_state data at hand instead of crashing; return None if
+        that isn't possible so the caller can record the validation failure
+        without issuing a retry, rather than raise.
+        """
+        req = canon_req_by_id.get(cid)
+        if req is not None:
+            return req
+        try:
+            rows_by_index = {r["row_index"]: r for r in table["rows"]}
+            rows = [rows_by_index[ri] for ri in chunk["row_indexes"]]
+        except KeyError:
+            return None
+        return {
+            "chunk_id": cid, "table_index": ts["table_index"],
+            "context_grouping": ts["context_grouping"],
+            "column_mapping": ts["column_mapping"],
+            "header_row": table["header_row"], "rows": rows,
+            "instructions_file": "prompts/canonicalize.md"}
+
     for raw_line in _read_response_lines(
             run_dir / "canonicalize_responses.jsonl"):
         fp = _fingerprint(raw_line)
@@ -576,8 +605,13 @@ def cmd_resolve(args):
                     new_records.append(canonical.failed_record(
                         table, rows_by_index[ri], "canonicalize-rejected"))
             else:
-                new_canon_requests.append(dict(
-                    canon_req_by_id[cid], retry=True, previous_errors=errs))
+                retry_req = _canon_retry_request(cid, ts, table, chunk)
+                if retry_req is not None:
+                    new_canon_requests.append(dict(
+                        retry_req, retry=True, previous_errors=errs))
+                # else: request could not be found or reconstructed -- the
+                # validation failure above is still recorded; the chunk
+                # simply stays pending instead of crashing the batch.
             continue
         canon_ok += 1
         chunk["done"] = True

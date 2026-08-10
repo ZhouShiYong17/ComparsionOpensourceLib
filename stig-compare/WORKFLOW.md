@@ -2,7 +2,7 @@
 
 > A Claude Code Skill that compares a company STIG submission (Word or Excel — messy tables, no STIG IDs required) against the official STIG rule set, and produces one self-contained HTML report built for human verification.
 
-**At a glance:** 2 files in → 1 report out · Word / Excel / CSV / JSON · 109 automated tests · fully offline (no network, ever) · every claim traceable to source.
+**At a glance:** 2 files in → 1 report out · Word / Excel / CSV / JSON · 130 automated tests · fully offline (no network, ever) · every claim traceable to source.
 
 The design principle: **code does everything code can do reliably; Claude is used only where language must be interpreted — and nothing it says is trusted until it survives mechanical verification.**
 
@@ -131,4 +131,4 @@ Feedback always strengthens the test suite; it only becomes an active rule after
 
 ---
 
-*stig-compare v0.1.0 · deterministic pipeline + validated Claude passes · 109 tests · every run stamps skill, extraction, pipeline, prompt and rule-registry versions into its report.*
+*stig-compare v0.2.0 · deterministic pipeline + validated Claude passes · 130 tests · every run stamps skill, extraction, pipeline, prompt and rule-registry versions into its report.*

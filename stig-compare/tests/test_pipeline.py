@@ -1059,3 +1059,76 @@ def test_malformed_jsonl_matching_response_tolerated(tmp_path, fixture_paths):
     state = {m["record_id"]: m
             for m in common.read_jsonl(run_dir / "match_state.jsonl")}
     assert state[req["record_id"]]["tier"] is not None
+
+
+def test_canonicalize_retry_survives_response_for_same_call_chunk(
+        tmp_path, fixture_paths):
+    """Regression: canon_req_by_id is built from canonicalize_requests.jsonl
+    on disk *before* the table-mapping pass in this same resolve call
+    appends the newly created chunk's request (only persisted at the end
+    of the call). A canonicalize response answering such a chunk -- chunk
+    ids are predictable, e.g. "T3-C0" for table 3's first chunk -- used to
+    KeyError on the retry path (canon_req_by_id[cid]), crashing resolve
+    before any persistence. Because the response line was never marked
+    consumed, the same crash reproduced on every subsequent resolve
+    (livelock). Reproduce by writing an invalid canonicalize response for
+    "T3-C0" alongside the table-mapping answers, before the chunk's own
+    request has ever touched disk."""
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    reqs = common.read_jsonl(run_dir / "table_mapping_requests.jsonl")
+    answers = []
+    for r in reqs:
+        if r["table_index"] == 1:
+            answers.append(_mapping_answer(r, "irrelevant",
+                                           reason="general-info"))
+        elif r["table_index"] == 2:
+            answers.append(_mapping_answer(r, "irrelevant",
+                                           reason="instructions"))
+        elif r["table_index"] == 3:
+            answers.append(_mapping_answer(r, mapping=EX1_MAPPING))
+        else:
+            answers.append(_mapping_answer(r, mapping=EX2_MAPPING))
+    common.write_jsonl(run_dir / "table_mapping_responses.jsonl", answers)
+    # Table 3 (EX1) has only 2 rows -> a single chunk, "T3-C0", not yet
+    # created anywhere on disk. Pre-write an invalid answer for it now.
+    common.write_jsonl(run_dir / "canonicalize_responses.jsonl",
+                       [{"chunk_id": "T3-C0", "rows": "not-a-list"}])
+
+    rc = pipeline.main(["resolve", "--run-dir", str(run_dir)])
+    assert rc == 0                     # must not crash (no KeyError)
+
+    failures = common.read_jsonl(run_dir / "validation_failures.jsonl")
+    assert any(f["kind"] == "canonicalize" and f["errors"] == ["bad-rows"]
+              for f in failures)
+
+    tstate = {t["table_index"]: t
+              for t in common.read_jsonl(run_dir / "table_state.jsonl")}
+    chunk = tstate[3]["chunks"]["T3-C0"]
+    assert chunk["failures"] == 1
+    assert chunk["done"] is False       # first strike, not yet rejected
+
+    canon_reqs = common.read_jsonl(run_dir / "canonicalize_requests.jsonl")
+    retries = [r for r in canon_reqs
+              if r["chunk_id"] == "T3-C0" and r.get("retry")]
+    assert len(retries) == 1
+    assert retries[0]["previous_errors"] == ["bad-rows"]
+    assert retries[0]["table_index"] == 3
+    assert retries[0]["instructions_file"] == "prompts/canonicalize.md"
+
+    # A second invalid answer must two-strike the chunk normally instead of
+    # crashing or retrying forever (livelock guard).
+    with open(run_dir / "canonicalize_responses.jsonl", "a",
+              encoding="utf-8") as f:
+        f.write(json.dumps({"chunk_id": "T3-C0", "rows": "still-bad"}) + "\n")
+    rc = pipeline.main(["resolve", "--run-dir", str(run_dir)])
+    assert rc == 0
+    tstate = {t["table_index"]: t
+              for t in common.read_jsonl(run_dir / "table_state.jsonl")}
+    chunk = tstate[3]["chunks"]["T3-C0"]
+    assert chunk["done"] is True
+    assert chunk["failures"] == 2

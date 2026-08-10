@@ -65,3 +65,23 @@ def test_dedup_and_contradictions():
     contras = validate.find_contradictions(kept)
     assert contras == [{"finding_ids": ["F-1", "F-3"],
                         "code": "contradictory-verdicts"}]
+
+
+def test_empty_row_quote_rejected():
+    out = _good_match()
+    out["row_quote"] = ""
+    errs = validate.validate_match_output(out, ["V-1001"], _ROW, _RULES)
+    assert "row-quote-not-found" in errs
+
+
+def test_empty_rule_quote_rejected():
+    out = _good_match()
+    out["rule_quote"] = ""
+    errs = validate.validate_match_output(out, ["V-1001"], _ROW, _RULES)
+    assert "rule-quote-not-found" in errs
+
+
+def test_rule_id_in_shortlist_but_missing_from_rules_dict():
+    out = _good_match()
+    errs = validate.validate_match_output(out, ["V-1001"], _ROW, {})
+    assert "rule-quote-not-found" in errs

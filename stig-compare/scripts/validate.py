@@ -34,10 +34,19 @@ def validate_match_output(output, shortlist_ids, row, rules_by_id):
         rid = output["rule_id"]
         if rid not in shortlist_ids:
             errs.append("rule-not-in-shortlist")
-        if not quote_exists(output["row_quote"], row["original_company_text"]):
+        # Check for empty row_quote after folding
+        if not common.fold_ws(output["row_quote"]):
             errs.append("row-quote-not-found")
-        if rid in rules_by_id and not quote_exists(
+        elif not quote_exists(output["row_quote"], row["original_company_text"]):
+            errs.append("row-quote-not-found")
+        # Check for empty rule_quote after folding
+        if not common.fold_ws(output["rule_quote"]):
+            errs.append("rule-quote-not-found")
+        elif rid in rules_by_id and not quote_exists(
                 output["rule_quote"], _rule_text(rules_by_id[rid])):
+            errs.append("rule-quote-not-found")
+        elif rid in shortlist_ids and rid not in rules_by_id:
+            # Rule ID is in shortlist but not in rules dict - unverifiable
             errs.append("rule-quote-not-found")
     elif decision == "ambiguous":
         ids = output["ambiguous_rule_ids"]
@@ -52,12 +61,16 @@ def validate_semantic_output(output, row, rule):
         errs.append("bad-finding-type")
     if output.get("verdict") not in VERDICTS:
         errs.append("bad-verdict")
-    if "row_quote" in output and not quote_exists(
-            output["row_quote"], row["original_company_text"]):
-        errs.append("row-quote-not-found")
-    if "rule_quote" in output and not quote_exists(
-            output["rule_quote"], _rule_text(rule)):
-        errs.append("rule-quote-not-found")
+    if "row_quote" in output:
+        if not common.fold_ws(output["row_quote"]):
+            errs.append("row-quote-not-found")
+        elif not quote_exists(output["row_quote"], row["original_company_text"]):
+            errs.append("row-quote-not-found")
+    if "rule_quote" in output:
+        if not common.fold_ws(output["rule_quote"]):
+            errs.append("rule-quote-not-found")
+        elif not quote_exists(output["rule_quote"], _rule_text(rule)):
+            errs.append("rule-quote-not-found")
     return errs
 
 

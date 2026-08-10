@@ -97,6 +97,15 @@ def extract_official(path):
             records.append(rec)
         if not records:
             warnings.append({"code": "empty-official-file", "detail": "json: empty"})
+        elif all(not any(rec[k] for k in OFFICIAL_HEADER_SYNONYMS)
+                for rec in records):
+            # Records parsed, but none of their keys matched a canonical
+            # field name (JSON records are matched by exact canonical key,
+            # not the header-synonym table used for CSV/XLSX) -- surface
+            # that instead of silently emitting N all-blank records.
+            warnings.append({"code": "unmapped-json-keys",
+                             "detail": f"{len(records)} records, all "
+                                      "canonical fields empty"})
     elif suffix == ".xlsx":
         wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
         records, warnings = [], []

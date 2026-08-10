@@ -14,6 +14,8 @@ called on a candidate that would regress the suite, even if a caller skips
 straight to it.
 """
 import json
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -141,8 +143,22 @@ def run_suite(package_root, registry=None):
     total = passed = failed = advisory = 0
     failures = []
     for cf in case_files:
-        case = json.loads(cf.read_text(encoding="utf-8"))
-        result = run_case(case, registry)
+        case_id = cf.stem                    # fallback if the file itself
+        #                                       can't even be parsed
+        try:
+            case = json.loads(cf.read_text(encoding="utf-8"))
+            case_id = case.get("case_id", case_id)
+            result = run_case(case, registry)
+        except Exception as exc:
+            # A single malformed/shape-mismatched regression case must never
+            # abort the whole suite (and therefore evaluate_candidate/
+            # approve_candidate) -- it counts as a hard failure instead, so
+            # the gate stays conservative (unreplayable = can't vouch for
+            # it) while every other case still runs. Detail carries only
+            # the exception's type name -- never document text or the
+            # exception's own message, which could echo file contents.
+            result = {"case_id": case_id, "passed": False, "advisory": False,
+                      "detail": f"unreplayable:{type(exc).__name__}"}
         total += 1
         if result["advisory"]:
             advisory += 1
@@ -184,6 +200,26 @@ def evaluate_candidate(package_root, candidate_path):
             "approvable": approvable}
 
 
+def _atomic_write_json(path, data):
+    """Write `data` as JSON to `path` without ever leaving a half-written
+    or corrupted file if the process dies mid-write: write to a sibling
+    temp file first, then os.replace() -- an atomic rename on every
+    platform we run on (including Windows, unlike os.rename)."""
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=1))
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.remove(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def approve_candidate(package_root, candidate_path, approver):
     """Moves an approvable candidate into registry.json as an active rule.
 
@@ -191,6 +227,15 @@ def approve_candidate(package_root, candidate_path, approver):
     this re-check happens even though a caller is expected to have already
     consulted `evaluate_candidate`, so the gate cannot be skipped
     programmatically (spec section 10, defense in depth).
+
+    Safe to retry: if a previous call already wrote the registry entry but
+    failed (or was never reached) before deleting the candidate file, a
+    retry with the same candidate file recognizes the rule_id is already in
+    the registry, skips re-appending/re-bumping the version, and just
+    finishes the cleanup (deletes the stale candidate file). Without this
+    guard a retry would append a second entry with the same rule_id, which
+    rules.load_registry() rejects forever after -- bricking every future
+    registry load.
     """
     package_root = Path(package_root)
     candidate_path = Path(candidate_path)
@@ -203,19 +248,27 @@ def approve_candidate(package_root, candidate_path, approver):
             f"trial_failed={verdict['trial']['failed']}")
 
     candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-    candidate["status"] = "active"
-    provenance = dict(candidate.get("provenance") or {})
-    provenance["approved_by"] = approver
-    provenance["approved"] = datetime.now().isoformat(timespec="seconds")
-    candidate["provenance"] = provenance
+    rule_id = candidate["rule_id"]
 
     registry_path = package_root / "rules" / "registry.json"
     registry = rules_mod.load_registry(registry_path)
-    registry.setdefault("rules", []).append(candidate)
-    registry["registry_version"] = registry.get("registry_version", 0) + 1
-    registry_path.write_text(json.dumps(registry, indent=1), encoding="utf-8")
+    existing_ids = {r.get("rule_id") for r in registry.get("rules", [])}
+    already_approved = rule_id in existing_ids
 
-    candidate_path.unlink()
+    if not already_approved:
+        candidate["status"] = "active"
+        provenance = dict(candidate.get("provenance") or {})
+        provenance["approved_by"] = approver
+        provenance["approved"] = datetime.now().isoformat(timespec="seconds")
+        candidate["provenance"] = provenance
 
-    return {"candidate_id": candidate["rule_id"], "approved_by": approver,
-            "registry_version": registry["registry_version"]}
+        registry.setdefault("rules", []).append(candidate)
+        registry["registry_version"] = registry.get("registry_version", 0) + 1
+        _atomic_write_json(registry_path, registry)
+
+    if candidate_path.exists():
+        candidate_path.unlink()
+
+    return {"candidate_id": rule_id, "approved_by": approver,
+            "registry_version": registry["registry_version"],
+            "already_approved": already_approved}

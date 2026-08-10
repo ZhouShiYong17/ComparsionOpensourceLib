@@ -56,13 +56,45 @@ def _expected_for(classification, finding):
     return {"note_only": True}
 
 
-def _build_snapshot(finding, manifest):
+def _load_replay_lookups(run_dir):
+    """Full company-row / official-rule records for replay-ready snapshots.
+
+    Task 14's regression.run_case() replays candidates.generate() +
+    compare_values.deterministic_verdict() on a case's snapshot, which needs
+    the FULL row/rule records (stig_description, observed_value_or_evidence,
+    expected_value, etc.) -- not the trimmed raw-text-only excerpt this
+    module otherwise keeps for the audit trail. Tolerant: returns (None,
+    None) if either artifact is missing (e.g. an older/foreign run_dir) so
+    callers fall back to the trimmed, non-replayable snapshot shape instead
+    of failing ingestion entirely.
+    """
+    run_dir = Path(run_dir)
+    rows_path = run_dir / "company_rows.jsonl"
+    rules_path = run_dir / "official_rules.jsonl"
+    if not rows_path.exists() or not rules_path.exists():
+        return None, None
+    rows_by_id = {r["row_id"]: r for r in common.read_jsonl(rows_path)}
+    rules_by_id = {r["rule_id"]: r for r in common.read_jsonl(rules_path)}
+    return rows_by_id, rules_by_id
+
+
+def _build_snapshot(finding, manifest, rows_by_id=None, rules_by_id=None):
     """Minimal excerpt: the finding (with its company row trimmed to raw
     text + source_reference, and official rule/match as already carried on
     the finding), plus a manifest subset of hashes + versions. Never whole
-    documents (spec section 9)."""
+    documents (spec section 9) -- even the replay-ready addition below is
+    capped at exactly one company row and one official rule, the same
+    single-row/single-rule excerpt already used for the audit fields.
+
+    When `rows_by_id`/`rules_by_id` are supplied and contain this finding's
+    row_id/rule_id, also attaches top-level "company_row" (the full row
+    record) and "official_rules" (a one-element list with the full rule
+    record) -- the shape Task 14's regression.run_case() replays against.
+    Callers can detect whether that succeeded via `"company_row" in
+    snapshot`.
+    """
     company_row = finding.get("company_row", {}) or {}
-    return {
+    snapshot = {
         "finding": {
             "finding_id": finding.get("finding_id"),
             "row_id": finding.get("row_id"),
@@ -82,6 +114,12 @@ def _build_snapshot(finding, manifest):
             "versions": manifest.get("versions", {}) or {},
         },
     }
+    full_row = (rows_by_id or {}).get(finding.get("row_id"))
+    full_rule = (rules_by_id or {}).get(finding.get("rule_id"))
+    if full_row is not None and full_rule is not None:
+        snapshot["company_row"] = full_row
+        snapshot["official_rules"] = [full_rule]
+    return snapshot
 
 
 def _comment_names_other_field(comment):
@@ -127,6 +165,7 @@ def ingest(feedback_path, run_dir, package_root):
     final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
     manifest = final.get("manifest", {}) or {}
     findings_by_id = {f["finding_id"]: f for f in final.get("findings", []) or []}
+    rows_by_id, rules_by_id = _load_replay_lookups(run_dir)
 
     stored, cases, candidates_out, errors = [], [], [], []
 
@@ -147,7 +186,7 @@ def ingest(feedback_path, run_dir, package_root):
             errors.append(f"duplicate-feedback: {fb_id} (finding {fid})")
             continue
 
-        snapshot = _build_snapshot(finding, manifest)
+        snapshot = _build_snapshot(finding, manifest, rows_by_id, rules_by_id)
 
         # 1. Store the feedback item itself, always.
         fb_record = {
@@ -161,7 +200,11 @@ def ingest(feedback_path, run_dir, package_root):
         fb_path.write_text(json.dumps(fb_record, indent=1), encoding="utf-8")
         stored.append(fb_id)
 
-        # 2. Always write a regression case.
+        # 2. Always write a regression case. When the full row/rule records
+        # weren't available (see _build_snapshot), the case still carries
+        # its (trimmed-only) snapshot, but flagged so it's clear it can't
+        # actually be replayed by regression.run_suite() -- the case is
+        # still real for audit purposes, just not machine-replayable.
         rc_id = "RC-" + suffix
         rc_record = {
             "case_id": rc_id,
@@ -169,6 +212,8 @@ def ingest(feedback_path, run_dir, package_root):
             "snapshot": snapshot,
             "expected": _expected_for(classification, finding),
         }
+        if "company_row" not in snapshot:
+            rc_record["replay_note"] = "not-replayable"
         (regression_dir / f"{rc_id}.json").write_text(
             json.dumps(rc_record, indent=1), encoding="utf-8")
         cases.append(rc_id)

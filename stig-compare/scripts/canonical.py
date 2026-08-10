@@ -6,6 +6,8 @@ reconciliation. Claim synonyms are intentionally minimal — extensions come
 through the rules registry's equivalent-terminology category, never by
 editing this file per-submission.
 """
+import re
+
 import common
 import normalize
 
@@ -21,12 +23,18 @@ IRRELEVANT_REASONS = {"instructions", "general-info", "toc", "signoff",
                       "other"}
 DISPOSITIONS = {"record", "separator", "continuation"}
 
+_NEGATED_COMPLIANCE = re.compile(
+    r"\b(?:non|not|no|never|cannot|can't|won't)[ -]*(?:be )?"
+    r"(?:comply|compliant|complies|compliance|adopt)")
+
 
 def normalize_claim(text):
     norm = normalize.norm_text(text)
     if not norm:
         return "unknown"
     if "deviat" in norm:
+        return "deviation"
+    if _NEGATED_COMPLIANCE.search(norm):
         return "deviation"
     if "comply" in norm or "compliant" in norm or "adopt" in norm:
         return "comply"

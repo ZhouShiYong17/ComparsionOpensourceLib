@@ -21,6 +21,10 @@ def test_normalize_claim():
     assert canonical.normalize_claim("Adopt company standards") == "comply"
     assert canonical.normalize_claim("") == "unknown"
     assert canonical.normalize_claim("see remarks") == "unknown"
+    assert canonical.normalize_claim("Non-Compliant") == "deviation"
+    assert canonical.normalize_claim("NOT COMPLY") == "deviation"
+    assert canonical.normalize_claim("Do not adopt") == "deviation"
+    assert canonical.normalize_claim("noncompliant") == "deviation"
 
 
 def test_chunk_rows_respects_size_and_merged_rows():

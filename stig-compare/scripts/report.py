@@ -59,6 +59,9 @@ section{margin:1.6rem 0}
 .badge.confidence-Low{background:#fef3f2;color:var(--bad)}
 .badge.review{background:#fef0c7;color:#7a2e0e}
 .badge.disputed{background:#fef3f2;color:var(--bad);border:1px solid var(--bad)}
+.badge.finding-type{background:#eef2ff;color:#3538cd}
+.interpretation{background:#f2f4f7;border-left:3px solid #3538cd;
+                padding:.4rem .7rem;margin:.3rem 0}
 .quote{background:#f2f4f7;border-left:3px solid #98a2b3;padding:.3rem .6rem;
        font-family:Consolas,monospace;font-size:.85rem;white-space:pre-wrap}
 .quote-label{font-size:.75rem;color:var(--muted);text-transform:uppercase;
@@ -323,6 +326,8 @@ def _finding_html(f):
     confidence = f.get("confidence") or "Unknown"
     review = bool(f.get("human_review_needed"))
     disputed = bool(f.get("disputed"))
+    finding_type = f.get("finding_type")
+    interpretation = f.get("interpretation")
     company = f.get("company_row", {}) or {}
     official = f.get("official_rule", {}) or {}
     match = f.get("match", {}) or {}
@@ -334,6 +339,12 @@ def _finding_html(f):
         f'<span class="badge confidence-{esc(confidence)}">'
         f'confidence: {esc(confidence)}</span>',
     ]
+    if finding_type:
+        # Surfaces the semantic classification (spec section 5) -- without
+        # this, the "wrong classification" feedback option has nothing on
+        # the card for a reviewer to judge as right or wrong.
+        badges.append(
+            f'<span class="badge finding-type">type: {esc(finding_type)}</span>')
     if review:
         badges.append('<span class="badge review">HUMAN REVIEW NEEDED</span>')
     if disputed:
@@ -349,6 +360,10 @@ def _finding_html(f):
 
     applied_html = ", ".join(esc(r) for r in applied_rules) if applied_rules \
         else "none"
+
+    interpretation_html = (
+        f'<h4>Interpretation</h4><div class="interpretation">'
+        f'{esc(interpretation)}</div>' if interpretation else "")
 
     fb_options = "".join(
         f'<option value="{esc(o)}">{esc(o) if o else "(select)"}</option>'
@@ -377,6 +392,7 @@ def _finding_html(f):
   </div>
   <h4>Evidence</h4>
   {_observation_html(f.get('observation'))}
+  {interpretation_html}
   <h4>Match</h4>
   <p><b>Tier:</b> {esc(match.get('tier'))}</p>
   {_score_table(match.get('candidates'))}

@@ -27,7 +27,26 @@ def _final(tmp_path):
                             "source_reference": {"table_index": 1,
                                                  "row_index": 1}},
             "official_rule": {"rule_id": "V-1001", "title": "Password reuse",
-                              "check_text": "check", "expected_value": "9 or more"}}],
+                              "check_text": "check", "expected_value": "9 or more"}},
+            {
+            "finding_id": "F-33334444", "row_id": "R-bbbb0002",
+            "rule_id": "V-1002", "verdict": "Non-Compliant",
+            "finding_type": "weaker", "deterministic": False,
+            "confidence": "Medium", "human_review_needed": True,
+            "basis": "semantic-comparison",
+            "observation": {"row_quote": "60 days",
+                            "rule_quote": "no greater than 60 days"},
+            "interpretation": "Company policy uses a coarser boundary than "
+                              "the official rule requires.",
+            "skeptic": None, "applied_rules": [],
+            "match": {"tier": "T2", "candidates": []},
+            "company_row": {"original_company_text":
+                            "Medium | rotate passwords | 60 days",
+                            "source_reference": {"table_index": 1,
+                                                 "row_index": 2}},
+            "official_rule": {"rule_id": "V-1002", "title": "Max password age",
+                              "check_text": "check", "expected_value":
+                              "60 days or less"}}],
         "match_state": [], "ambiguous": [],
         "coverage": {"company": {"total": 1, "matched": 1, "ambiguous": 0,
                                  "unmatched": 0, "ignored_by_rule": 0,
@@ -71,3 +90,21 @@ def test_feedback_widgets_present(tmp_path):
     assert "wrong match" in html_text
     assert "Export feedback" in html_text
     assert "data-fid=\"F-11112222\"" in html_text
+
+
+def test_semantic_finding_shows_finding_type_and_interpretation(tmp_path):
+    # Important finding 2: the report must surface both finding_type (so the
+    # "wrong classification" feedback option is meaningful) and the
+    # interpretation ("reason") for a semantic finding.
+    html_text = Path(report.render(_final(tmp_path))).read_text(encoding="utf-8")
+    assert "weaker" in html_text
+    assert "Interpretation" in html_text
+    assert ("Company policy uses a coarser boundary than the official rule "
+           "requires.") in html_text
+
+    # And a deterministic finding with finding_type/interpretation both None
+    # must render neither block -- no stray "None" text or empty label.
+    art = re.search(
+        r'<article class="finding" data-fid="F-11112222".*?</article>',
+        html_text, re.S).group(0)
+    assert "Interpretation" not in art

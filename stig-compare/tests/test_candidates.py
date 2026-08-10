@@ -2,16 +2,48 @@ import pytest
 
 from fixtures.build_fixtures import build_all
 import candidates
+import canonical
+import common
 import extract
+import skeleton
+
+# Mirrors build_fixtures._HEADERS (Group | STIG Requirement | Description |
+# Command to Verify | Approved Setting | Observed Value): the mapping Claude's
+# table-mapping pass would produce for that fixed header layout. Column 0
+# ("Group") feeds context_grouping directly rather than a canonical data
+# field, same as canonicalize's real handling of an unmapped context column.
+_COMPANY_COLUMN_MAPPING = {
+    1: "stig_objective_or_requirement",
+    2: "stig_description",
+    3: "stig_command_or_value",
+    4: "company_approved_setting_or_expected_value",
+    5: "observed_value_or_evidence",
+}
+
+
+def _canonical_company_records(path):
+    """Mechanical stand-in for the table-mapping + canonicalize passes, used
+    only to give candidates.generate() canonical-shaped input in tests."""
+    table = skeleton.extract_skeleton(path)["tables"][0]
+    records = []
+    for row in table["rows"]:
+        fields, prov = {}, {}
+        for i, target in _COMPANY_COLUMN_MAPPING.items():
+            val = row["cells"][i] if i < len(row["cells"]) else ""
+            if val.strip():
+                fields[target] = val
+                prov[target] = {"row_index": row["row_index"], "cell_index": i}
+        context = common.fold_ws(row["cells"][0]) if row["cells"] else ""
+        records.append(canonical.build_record(
+            table, row, 0, fields, prov, {}, "", context))
+    return records
 
 
 @pytest.fixture(scope="module")
 def data(tmp_path_factory):
     fx = build_all(tmp_path_factory.mktemp("fx"))
     official = extract.extract_official(fx["official_csv"])["records"]
-    company_raw = extract.extract_company(fx["company_docx"])["records"]
-    # Transform row_id to record_id for canonical record interface
-    company = [dict(r, record_id=r.pop("row_id")) for r in company_raw]
+    company = _canonical_company_records(fx["company_docx"])
     return official, company
 
 

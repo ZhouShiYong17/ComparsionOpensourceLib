@@ -551,7 +551,7 @@ def _leftovers_html(final):
   <h3>Ambiguous matches</h3>
   {_ambiguous_html(final)}
 
-  <h3>Unresolved rows (needs-structuring-unresolved / extraction-failed)</h3>
+  <h3>Unresolved rows (extraction-failed)</h3>
   {_unresolved_html(final)}
 
   <details>

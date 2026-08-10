@@ -51,8 +51,10 @@ def test_skill_md_orchestration_contract():
     text = (PKG / "SKILL.md").read_text(encoding="utf-8")
     assert "name: stig-compare" in text
     for needle in ["pipeline.py start", "pipeline.py resolve",
-                   "pipeline.py finalize", "structuring_requests.jsonl",
+                   "pipeline.py finalize", "table_mapping_responses.jsonl",
+                   "canonicalize_responses.jsonl", "sweep",
                    "matching_requests.jsonl", "semantic_requests.jsonl",
                    "skeptic_responses.jsonl", "feedback.py ingest",
-                   "evaluate_candidate", "Never auto-approve"]:
+                   "evaluate_candidate", "Never auto-approve",
+                   "--allow-pending"]:
         assert needle in text

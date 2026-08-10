@@ -41,18 +41,25 @@ untrusted input from the pipeline's point of view — it is mechanically
 re-validated (quotes must be verbatim substrings of the supplied evidence,
 IDs must reference a real pending request, enums must be one of the allowed
 values) before it can affect `final.json`. A response that fails validation
-never silently disappears: it becomes a `validation_failures.jsonl` entry
-and, for matching/semantic decisions, gets one retry before the row is
-marked `Cannot Assess` / rejected. Do not try to work around a validation
+never silently disappears: it becomes a `validation_failures.jsonl` entry,
+and every response kind — `table_mapping`, `canonicalize`, `matching`,
+`sweep`, `semantic` — gets one retry (two strikes total) before the
+pipeline settles the unit mechanically instead of asking again: a table
+becomes `mapping-failed`, a chunk becomes `canonicalize-rejected` (its rows
+fall back to `extraction-failed` records), a record's match becomes
+`T4`/`llm-output-rejected`, and a semantic pair becomes `Cannot
+Assess`/`llm-output-rejected`. (`sweep` has no retry of its own — a
+rejected sweep response is simply dropped from that batch; the sweep pass
+itself never repeats within a run.) Do not try to work around a validation
 failure by inventing content that isn't actually in the evidence you were
 given — fix your answer using only what the request supplied, or leave the
 row for human review.
 
-One designed exception to "never proceed past a non-zero exit code": step 5
-below uses `finalize` exit code `4` (refused — pending matching/semantic
-work) as the retry loop's expected continue signal, not a failure. That
-exception is scoped exactly to that loop and its documented round cap —
-every other non-zero exit code, anywhere in any mode, must still be
+One designed exception to "never proceed past a non-zero exit code": step 8
+below uses `finalize` exit code `4` (refused — pending extraction/matching/
+semantic work) as its retry loop's expected continue signal, not a failure.
+That exception is scoped exactly to that loop and its documented round cap
+— every other non-zero exit code, anywhere in any mode, must still be
 surfaced rather than worked around.
 
 ## Compare mode
@@ -79,122 +86,191 @@ surfaced rather than worked around.
    do not retry the same file, do not attempt to re-parse or repair it
    yourself, and do not fabricate extraction results to keep going.
 
-4. **Answer structuring and matching requests, then resolve — repeat while
-   there is new work, capped at 2 rounds.** After `start` (and after every
-   `resolve`), `runs/<timestamp>/structuring_requests.jsonl` and
-   `matching_requests.jsonl` may contain pending records (a record already
-   answered in an earlier round is never rewritten — only the newly
-   appended ones need answers this round):
-   - For each record in `structuring_requests.jsonl` you have not yet
-     answered: read the file named by that record's `instructions_file`
-     (`prompts/structuring.md`), follow it exactly, and produce one JSON
-     object per record. Append each response as one line to
-     `structuring_responses.jsonl` in the run directory.
-   - For each record in `matching_requests.jsonl` you have not yet
-     answered: read its `instructions_file` (`prompts/matching.md`), follow
-     it, and append one JSON object per line to `matching_responses.jsonl`.
+4. **Answer table-mapping requests, then resolve — repeat while there is
+   new work, capped at 2 rounds.** `start` classifies nothing itself: every
+   table the company file contains lands in
+   `runs/<timestamp>/table_mapping_requests.jsonl` needing an answer (a
+   table already answered in an earlier round is never rewritten — only the
+   newly appended retries need answers this round).
+   - For each table you have not yet answered: read the file named by its
+     `instructions_file` (`prompts/table_mapping.md`), follow it exactly,
+     and produce one JSON object per table — `table_index`,
+     `classification` (`stig_relevant | irrelevant | uncertain`),
+     `irrelevant_reason`, `column_mapping` (column index -> canonical
+     field, `extra_field`, or `ignore`), and `context_grouping` (copied
+     verbatim, never composed or paraphrased). Append each response as one
+     line to `table_mapping_responses.jsonl`.
    - Run `python scripts/pipeline.py resolve --run-dir runs/<timestamp>`.
      A non-zero exit code must be surfaced, not worked around.
-   - `resolve` prints counts including `retries_pending` and regenerates
-     `matching_requests.jsonl` with newly-appended records when a row was
-     just structured or a matching answer needs a retry (bad/unverifiable
-     quote, rule not in the shortlist, etc. — the `previous_errors` field on
-     the retry record explains why). If `retries_pending > 0`, or either
-     `*_requests.jsonl` file grew, go back to the top of this step and
-     answer only the new records, then `resolve` again. Stop once a
-     `resolve` call reports nothing new, or after 2 rounds total — whichever
-     comes first. (Because every response line is fingerprinted, replaying
-     an already-answered line is always a safe no-op, so accumulating
-     answers across rounds in the same `*_responses.jsonl` file is fine.)
+   - A table that fails validation once comes back in
+     `table_mapping_requests.jsonl` with `retry: true` and
+     `previous_errors` — answer only that newly-appended entry on the next
+     round. A table that fails twice is settled mechanically as
+     `mapping-failed` (its rows surface later as `extraction_failed`
+     coverage plus a `mapping-failed` warning) and is never re-requested.
+   - Stop once a `resolve` call reports no new/retried table-mapping
+     entries, or after 2 rounds total — whichever comes first.
 
-5. **Answer semantic requests — same retry-loop shape as step 4, capped at
-   2 rounds, and never with `--allow-pending` inside the loop.** If
-   `runs/<timestamp>/semantic_requests.jsonl` doesn't exist after step 4,
-   there is nothing to answer — every match in this run was decided
-   deterministically; skip straight to step 6. Otherwise, loop:
-   - For each record in `semantic_requests.jsonl` you have not yet
-     answered (on a second round, that means the newly-appended records
-     carrying `retry: true` / `previous_errors`): read its
-     `instructions_file` (`prompts/semantic_compare.md`), follow it, and
-     append one JSON object per line to `semantic_responses.jsonl`.
-   - Run `python scripts/pipeline.py finalize --run-dir runs/<timestamp> --no-report`
-     — **without** `--allow-pending`.
-     - Exit `0`: every matching/semantic pair now has a real resolution —
-       the two-strike protocol already turns a second bad retry into an
-       honest `Cannot Assess`/`llm-output-rejected` finding automatically,
-       inside this same call, with no need for `--allow-pending`. Stop
-       looping; `final.json` is ready for step 6.
-     - Exit `4` (prints `pending matching=…/pending semantic=…`): this is
-       this loop's designed continue signal (see the hard-rules note
-       above), not a failure. It means at least one pair only has a
-       strike-1 rejection queued for retry so far — check the
-       newly-appended `retry: true` record in `semantic_requests.jsonl`
-       and the new entry in `validation_failures.jsonl` for why. If you
-       are under 2 rounds, go back to the top of this step and answer only
-       the new retry records. **Do not reach for `--allow-pending` here**
-       — doing so before the retry has been given its second chance would
-       silently and permanently sweep an answerable pair into a
-       `semantic-pass-not-run` finding that falsely claims the semantic
-       pass never ran.
-     - Any other non-zero exit must be surfaced per the hard rules — do
-       not loop past it.
-   - If you reach 2 rounds and `finalize --no-report` (still without
-     `--allow-pending`) is still refusing, that means something was never
-     answered at all (not merely retried and rejected twice) — run it once
-     more with `--allow-pending` added (keep `--no-report`) so the
-     genuinely-unanswered pair is honestly marked `*-pass-not-run` /
-     `human_review_needed: true` instead of being left in limbo. This is
-     the only place before step 6 where `--allow-pending` may be used, and
-     only as this last resort after both rounds are exhausted.
+5. **Answer canonicalize requests — same loop shape, capped at 2 rounds.**
+   Every `stig_relevant` or `uncertain` table from step 4 is split into one
+   or more row chunks in `canonicalize_requests.jsonl` (an `irrelevant`
+   table produces none).
+   - For each chunk you have not yet answered: read `prompts/canonicalize.md`,
+     follow it exactly, and produce one response object per chunk —
+     `chunk_id` plus one entry per row (`disposition: record | separator |
+     continuation`, with `records`/`fields`/`field_provenance` for a
+     `record` disposition). **Every row of every chunk must be accounted
+     for exactly once** — a response that loses or duplicates a
+     `row_index` is rejected mechanically. Append to
+     `canonicalize_responses.jsonl`.
+   - Run `resolve` again. A chunk that fails validation once is
+     re-requested with `retry: true`/`previous_errors`; one that fails
+     twice is settled as `canonicalize-rejected` and its rows become
+     `extraction-failed` records rather than blocking the run. Once every
+     chunk of a table is done, that same `resolve` call builds its
+     canonical company records and their matching shortlists —
+     `matching_requests.jsonl` appears (or grows) at that point.
+   - Stop once nothing new appears in `canonicalize_requests.jsonl`, or
+     after 2 rounds total.
 
-6. **Dispatch the skeptical validator, then finalize for real.**
-   - The `final.json` produced by step 5's last `finalize` call already
-     has, for every finding (deterministic or semantic), exactly the
-     evidence shape `prompts/validator.md` expects: `finding_id`, `row_id`,
-     `rule_id`, `verdict` (the claim being tested), `finding_type`,
-     `observation`, `company_row` (`original_company_text` +
-     `source_reference` only), and `official_rule` (`rule_id`/`title`/
-     `check_text`/`expected_value` — deliberately no `fix_text`/`severity`).
-   - For every finding in `final.json` whose `finding_type` is not `null`
-     (a semantic-comparison finding — deterministic findings, where
-     `finding_type` is `null`, do not go through the skeptic), dispatch the
-     skeptical validator **using the Agent tool**, as an isolated subagent
-     with no access to this conversation's reasoning. Give that subagent
-     ONLY: the contents of `prompts/validator.md`, and the finding's raw
-     evidence (`finding_id`, `row_id`, `rule_id`, `verdict`, `finding_type`,
-     `observation`, `company_row`, `official_rule`) — **never** the first
-     pass's `interpretation`, and never anything from your own earlier
-     matching/semantic reasoning. You may batch multiple findings into one
-     subagent dispatch, but the subagent itself must be fresh and isolated
-     — it forms its own conclusion from the raw evidence, not from what the
-     first pass already decided. Its job is to try to DISPROVE the finding
-     (misquotes, wrong-record comparisons, meaning-changing paraphrase,
-     formatting-only differences misclassified as semantic) and answer
-     `{"finding_id": "...", "outcome": "upheld | refuted | undetermined",
-     "reason": "..."}`. Append one such JSON object per line to
-     `skeptic_responses.jsonl`.
-   - Run `python scripts/pipeline.py finalize --run-dir runs/<timestamp> --allow-pending`
-     **one final time — this is the only `finalize` call in the whole
-     compare-mode flow that omits `--no-report`, and the only one that
-     unconditionally carries `--allow-pending`.** By this point step 5 has
-     already given every matching/semantic retry its full 2 rounds, so
-     `--allow-pending` here cannot prematurely sweep anything answerable —
-     it only (a) merges the skeptic outcomes (`disputed`,
-     `skeptic.outcome`/`skeptic.reason`) into the findings, (b) recomputes
-     `confidence`/`human_review_needed`, and (c) renders `report.html`.
-     Because responses are fingerprinted, calling `finalize` again here is
-     always safe. A non-zero exit code (e.g. exit 3 if coverage accounting
-     doesn't add up) must still be surfaced, not silently retried past.
+6. **Answer matching requests — 2-round loop as before** (multi-select:
+   one selection per genuinely-matching candidate; `none`/`ambiguous`
+   always acceptable), then:
+   - For each record in `matching_requests.jsonl` you have not yet
+     answered: read `prompts/matching.md`, follow it, and append one JSON
+     object per record to `matching_responses.jsonl`. A record can
+     genuinely satisfy more than one official rule — emit one `selections`
+     entry per matched `rule_id`, each with its own verbatim
+     `row_quote`/`rule_quote`, rather than picking only the best one.
+   - Run `resolve` again. A rejected matching answer gets one retry
+     (`retry: true`/`previous_errors` on the re-appended request) before
+     the record is forced to tier `T4` with warning `llm-output-rejected`
+     — never fabricate a match to avoid that outcome.
+   - Stop once `resolve` reports no new/retried matching entries, or after
+     2 rounds total.
 
-7. **Present the results.** Report, in this order:
+7. **Run the sweep once:**
+   ```
+   python scripts/pipeline.py sweep --run-dir runs/<timestamp>
+   ```
+   This is a single deterministic pass, not a loop — a second `sweep` call
+   on the same run is a safe no-op. If every record already matched, or
+   every official rule is already addressed, it prints
+   `sweep: nothing-to-sweep` and there is nothing further to do here; move
+   on to step 8. Otherwise it writes `sweep_requests.jsonl`: batches of up
+   to 20 still-unmatched records against an index of the still-unaddressed
+   rules.
+   - For each batch, read `prompts/sweep.md` and follow it — **its
+     proposals are candidates for the matching pass to evaluate, not
+     matches themselves.** Propose a `(record_id, rule_id)` pair only when
+     the record plausibly speaks to that rule at all; an empty
+     `proposals` array is an acceptable answer. Append one response object
+     per batch to `sweep_responses.jsonl`, then `resolve`.
+   - `resolve` turns each accepted proposal into a fresh entry in
+     `matching_requests.jsonl` (marked `sweep_round: true`). Answer those
+     exactly as in step 6, then `resolve` once more. Because the sweep
+     pass itself never repeats, this is at most one extra round of
+     matching, not a new loop.
+
+8. **Answer semantic requests, then dispatch the skeptic and finalize for
+   real.** If `runs/<timestamp>/semantic_requests.jsonl` doesn't exist at
+   this point, every match in this run was decided deterministically —
+   skip straight to the skeptic dispatch below. Otherwise:
+   - **Semantic loop — same retry-loop shape as steps 4–6, capped at 2
+     rounds, and never with `--allow-pending` inside the loop:**
+     - For each record in `semantic_requests.jsonl` you have not yet
+       answered (on a second round, that means the newly-appended records
+       carrying `retry: true` / `previous_errors`): read its
+       `instructions_file` (`prompts/semantic_compare.md`), follow it, and
+       append one JSON object per line to `semantic_responses.jsonl`.
+     - Run `python scripts/pipeline.py finalize --run-dir runs/<timestamp> --no-report`
+       — **without** `--allow-pending`.
+       - Exit `0`: every table-mapping/canonicalize/matching/semantic pair
+         now has a real resolution — the two-strike protocol already
+         turns a second bad retry into an honest `Cannot Assess`/
+         `llm-output-rejected` finding automatically, inside this same
+         call, with no need for `--allow-pending`. Stop looping;
+         `final.json` is ready for the skeptic dispatch below.
+       - Exit `4` (prints `pending mapping=…/pending canonicalize=…/pending
+         matching=…/pending semantic=…`): this is this loop's designed
+         continue signal (see the hard-rules note above), not a failure.
+         Check the newly-appended `retry: true` record(s) and the new
+         entries in `validation_failures.jsonl` for why. If you are under
+         2 rounds, go back to the top of this loop and answer only the new
+         retry records. **Do not reach for `--allow-pending` here** —
+         doing so before a retry has been given its second chance would
+         silently and permanently sweep an answerable pair into a
+         `*-pass-not-run` finding that falsely claims that pass never ran.
+       - Any other non-zero exit must be surfaced per the hard rules — do
+         not loop past it.
+     - If you reach 2 rounds and `finalize --no-report` (still without
+       `--allow-pending`) is still refusing, that means something was
+       never answered at all (not merely retried and rejected twice) — run
+       it once more with `--allow-pending` added (keep `--no-report`) so
+       the genuinely-unanswered work is honestly marked `*-pass-not-run` /
+       `human_review_needed: true` instead of being left in limbo. This is
+       the only place before the skeptic dispatch where `--allow-pending`
+       may be used, and only as this last resort after both rounds are
+       exhausted.
+   - **Dispatch the skeptical validator, then finalize for real.**
+     - The `final.json` produced by the semantic loop's last `finalize`
+       call already has, for every finding (deterministic or semantic),
+       exactly the evidence shape `prompts/validator.md` expects:
+       `finding_id`, `row_id`, `rule_id`, `verdict` (the claim being
+       tested), `finding_type`, `observation`, `company_row`
+       (`original_company_text` + `source_reference` only), and
+       `official_rule` (`rule_id`/`title`/`check_text`/`expected_value` —
+       deliberately no `fix_text`/`severity`).
+     - For every finding in `final.json` whose `finding_type` is not `null`
+       (a semantic-comparison finding — deterministic findings, where
+       `finding_type` is `null`, do not go through the skeptic), dispatch
+       the skeptical validator **using the Agent tool**, as an isolated
+       subagent with no access to this conversation's reasoning. Give that
+       subagent ONLY: the contents of `prompts/validator.md`, and the
+       finding's raw evidence (`finding_id`, `row_id`, `rule_id`,
+       `verdict`, `finding_type`, `observation`, `company_row`,
+       `official_rule`) — **never** the first pass's `interpretation`, and
+       never anything from your own earlier matching/semantic reasoning.
+       You may batch multiple findings into one subagent dispatch, but the
+       subagent itself must be fresh and isolated — it forms its own
+       conclusion from the raw evidence, not from what the first pass
+       already decided. Its job is to try to DISPROVE the finding
+       (misquotes, wrong-record comparisons, meaning-changing paraphrase,
+       formatting-only differences misclassified as semantic) and answer
+       `{"finding_id": "...", "outcome": "upheld | refuted | undetermined",
+       "reason": "..."}`. Append one such JSON object per line to
+       `skeptic_responses.jsonl`.
+     - Run `python scripts/pipeline.py finalize --run-dir runs/<timestamp> --allow-pending`
+       **one final time — this is the only `finalize` call in the whole
+       compare-mode flow that omits `--no-report`, and the only one that
+       unconditionally carries `--allow-pending`.** By this point the
+       semantic loop has already given every retry its full 2 rounds, so
+       `--allow-pending` here cannot prematurely sweep anything
+       answerable — it only (a) merges the skeptic outcomes (`disputed`,
+       `skeptic.outcome`/`skeptic.reason`) into the findings, (b)
+       recomputes `confidence`/`human_review_needed`, and (c) renders
+       `report.html`. Because responses are fingerprinted, calling
+       `finalize` again here is always safe. A non-zero exit code (e.g.
+       exit 3 if coverage accounting doesn't add up) must still be
+       surfaced, not silently retried past.
+
+9. **Present the results.** Report, in this order:
    1. Warnings — everything in `final.json["warnings"]` (extraction
-      warnings, rule conflicts, dropped duplicate findings, contradictory
-      verdicts, low-coverage red banners). Lead with these.
+      warnings, `uncertain-table`, `mapping-failed`, rule conflicts,
+      dropped duplicate findings, `company-declared-deviation`,
+      `claim-contradicted`, contradictory verdicts, low-coverage red
+      banners). Lead with these.
    2. Coverage — `final.json["coverage"]`: how many company rows were
-      matched/ambiguous/unmatched/ignored/unresolved, and how many official
-      rules were addressed/unaddressed.
+      matched/ambiguous/unmatched/ignored/unresolved (note the
+      `ignored_irrelevant_table` bucket specifically — rows correctly
+      excluded by table triage, distinct from rows that were lost), and
+      how many official rules were addressed/unaddressed. Also check
+      `final.json["table_triage"]` (every table's classification,
+      `irrelevant_reason`, and `column_mapping`) and call out any
+      `uncertain` or `mapping-failed` table by name.
    3. The report path: `runs/<timestamp>/report.html`. It is
-      self-contained (no network calls) — open it directly from disk.
+      self-contained (no network calls) — open it directly from disk; its
+      dashboard includes the same table-triage panel.
    4. Offer the feedback flow: the report has an "Export feedback" button
       that downloads a `feedback.json`; if the user reviews the report and
       has corrections, they can hand that file back for feedback mode.

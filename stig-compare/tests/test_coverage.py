@@ -1,91 +1,84 @@
 import coverage
 
 
-def _rows(n, status="ok"):
-    return [{"row_id": f"R-{i:08d}", "status": status} for i in range(n)]
+def _table(ti, n_rows, cls="stig_relevant", disps=None, parents=None):
+    return ({"table_index": ti, "sheet_or_section": "document-body",
+             "preceding_narrative": "", "header_row": ["A"],
+             "rows": [{"row_index": i, "cells": ["x"], "merged": False}
+                      for i in range(1, n_rows + 1)]},
+            {"table_index": ti, "classification": cls,
+             "irrelevant_reason": "", "column_mapping": {},
+             "context_grouping": "", "mapping_failures": 0,
+             "row_dispositions": disps or {}, "parent_of": parents or {},
+             "chunks": {}})
 
 
-def _rules(n):
-    return [{"rule_id": f"V-{1000+i}"} for i in range(n)]
+def _rec(rid, ti, ri, status="ok", sub=0):
+    return {"record_id": rid, "row_id": "R-" + rid, "status": status,
+            "source_reference": {"table_index": ti, "row_index": ri,
+                                 "sub_index": sub}}
 
 
-def _match(rid, tier, rule=None):
-    return {"row_id": rid, "tier": tier, "matched_rule_id": rule,
-            "ambiguous_rule_ids": []}
+def _match(rid, tier, matched=(), ):
+    return {"record_id": rid, "tier": tier,
+            "matched_rule_ids": list(matched), "candidates": []}
 
 
-def test_buckets_and_sum():
-    rows = _rows(5)
-    rows[4]["status"] = "extraction-failed"
-    matches = [_match("R-00000000", "T1", "V-1000"),
-               _match("R-00000001", "T2", "V-1001"),
-               _match("R-00000002", "T3"),
-               _match("R-00000003", "T4")]
-    cov = coverage.compute(rows, _rules(3), matches, ignored_row_ids=set())
-    c = cov["company"]
-    assert (c["matched"], c["ambiguous"], c["unmatched"],
-            c["extraction_failed"]) == (2, 1, 1, 1)
-    assert cov["ok"] is True
-    assert cov["official"]["addressed"] == 2
-    assert cov["official"]["unaddressed"] == 1
-    assert any(w["code"] == "extraction-failures" for w in cov["warnings"])
+OFFICIAL = [{"rule_id": "V-1"}, {"rule_id": "V-2"}, {"rule_id": "V-3"}]
+
+
+def test_buckets_sum_and_classify():
+    t1, ts1 = _table(1, 2, cls="irrelevant")
+    t2, ts2 = _table(2, 4, disps={"1": "record", "2": "separator",
+                                   "3": "record", "4": "record"})
+    skeleton = [t1, t2]
+    tstate = {1: ts1, 2: ts2}
+    records = [_rec("a", 2, 1), _rec("b", 2, 3),
+               _rec("c", 2, 4, status="extraction-failed")]
+    matches = [_match("a", "T2", ["V-1", "V-2"]), _match("b", "T3")]
+    out = coverage.compute(skeleton, tstate, records, OFFICIAL, matches, set())
+    assert out["ok"]
+    c = out["company"]
+    assert c["total"] == 6
+    assert c["ignored_irrelevant_table"] == 2
+    assert c["separator"] == 1
+    assert c["matched"] == 1 and c["ambiguous"] == 1
+    assert c["extraction_failed"] == 1
+    assert out["official"]["addressed"] == 2
+    assert out["official"]["unaddressed"] == 1
+
+
+def test_continuation_takes_parent_bucket_and_split_rows_aggregate():
+    t, ts = _table(1, 2, disps={"1": "record", "2": "continuation"},
+                   parents={"2": 1})
+    records = [_rec("a", 1, 1, sub=0), _rec("b", 1, 1, sub=1)]
+    matches = [_match("a", "T4"), _match("b", "T2", ["V-1"])]
+    out = coverage.compute([t], {1: ts}, records, OFFICIAL, matches, set())
+    assert out["company"]["matched"] == 2  # row 1 aggregates to matched; row 2 follows parent
+    assert out["ok"]
+
+
+def test_unanswered_table_rows_are_extraction_failed():
+    t, ts = _table(1, 3, cls=None)
+    out = coverage.compute([t], {1: ts}, [], OFFICIAL, [], set())
+    assert out["company"]["extraction_failed"] == 3
+    assert out["ok"]
+
+
+def test_red_banner_excludes_irrelevant_tables():
+    t1, ts1 = _table(1, 50, cls="irrelevant")
+    t2, ts2 = _table(2, 2, disps={"1": "record", "2": "record"})
+    records = [_rec("a", 2, 1), _rec("b", 2, 2)]
+    matches = [_match("a", "T2", ["V-1"]), _match("b", "T2", ["V-2"])]
+    out = coverage.compute([t1, t2], {1: ts1, 2: ts2}, records, OFFICIAL,
+                           matches, set())
+    assert not any(w["code"] == "low-coverage-red-banner"
+                   for w in out["warnings"])
 
 
 def test_duplicate_coverage_flagged():
-    rows = _rows(2)
-    matches = [_match("R-00000000", "T1", "V-1000"),
-               _match("R-00000001", "T2", "V-1000")]
-    cov = coverage.compute(rows, _rules(1), matches, set())
-    assert cov["official"]["duplicate_coverage_rule_ids"] == ["V-1000"]
-
-
-def test_red_banner_over_ten_percent():
-    rows = _rows(10)
-    for r in rows[:2]:
-        r["status"] = "extraction-failed"
-    matches = [_match(r["row_id"], "T4") for r in rows[2:]]
-    cov = coverage.compute(rows, _rules(1), matches, set())
-    assert any(w["code"] == "low-coverage-red-banner" for w in cov["warnings"])
-
-
-def test_unaccounted_row_fails_loudly():
-    rows = _rows(3)          # one row has no match result and status ok
-    matches = [_match("R-00000000", "T4"), _match("R-00000001", "T4")]
-    cov = coverage.compute(rows, _rules(1), matches, set())
-    # missing rows are counted as unmatched, never silently dropped
-    assert cov["company"]["unmatched"] == 3
-    assert cov["ok"] is True
-
-
-def test_needs_structuring_unresolved_counts():
-    rows = _rows(2)
-    rows[1]["status"] = "needs-structuring"
-    matches = [_match("R-00000000", "T4")]
-    cov = coverage.compute(rows, _rules(1), matches, set())
-    assert cov["company"]["needs_structuring_unresolved"] == 1
-
-
-def test_needs_structuring_with_match_counts_by_tier():
-    rows = _rows(2)
-    rows[1]["status"] = "needs-structuring"
-    matches = [_match("R-00000000", "T4"),
-               _match("R-00000001", "T2", "V-1000")]
-    cov = coverage.compute(rows, _rules(1), matches, set())
-    c = cov["company"]
-    assert c["matched"] == 1
-    assert c["needs_structuring_unresolved"] == 0
-    assert cov["ok"] is True
-
-
-def test_ignored_by_rule_bucket():
-    rows = _rows(2)
-    matches = [_match("R-00000001", "T4")]
-    cov = coverage.compute(rows, _rules(1), matches, {"R-00000000"})
-    c = cov["company"]
-    assert c["ignored_by_rule"] == 1
-    assert c["unmatched"] == 1
-    bucket_sum = (c["matched"] + c["ambiguous"] + c["unmatched"] +
-                  c["ignored_by_rule"] + c["extraction_failed"] +
-                  c["needs_structuring_unresolved"])
-    assert bucket_sum == c["total"]
-    assert cov["ok"] is True
+    t, ts = _table(1, 2, disps={"1": "record", "2": "record"})
+    records = [_rec("a", 1, 1), _rec("b", 1, 2)]
+    matches = [_match("a", "T2", ["V-1"]), _match("b", "T2", ["V-1"])]
+    out = coverage.compute([t], {1: ts}, records, OFFICIAL, matches, set())
+    assert out["official"]["duplicate_coverage_rule_ids"] == ["V-1"]

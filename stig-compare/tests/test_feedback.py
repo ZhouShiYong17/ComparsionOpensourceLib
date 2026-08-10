@@ -89,3 +89,35 @@ def test_duplicate_feedback_skipped(env, tmp_path):
     result2 = feedback.ingest(p, run, pkg)
     assert result2["stored"] == []
     assert any("duplicate-feedback" in e for e in result2["errors"])
+
+
+# -- gate on "not meaningful" -> ignore-field candidates: added after code
+# review found the raw snake_case substring match near-inert on free-text
+# comments (e.g. "the description" never contains "stig_description").
+
+
+def test_not_meaningful_comment_naming_other_field_drafts_no_candidate(env, tmp_path):
+    pkg, run = env
+    p = tmp_path / "fb.json"
+    p.write_text(json.dumps(_fb([{
+        "finding_id": "F-11112222", "classification": "not meaningful",
+        "comment": "this is really about the description, not the "
+                   "observed value"}])), encoding="utf-8")
+    result = feedback.ingest(p, run, pkg)
+    assert len(result["cases"]) == 1
+    assert result["candidates"] == []
+
+
+def test_not_meaningful_comment_without_other_field_drafts_candidate(env, tmp_path):
+    pkg, run = env
+    p = tmp_path / "fb.json"
+    p.write_text(json.dumps(_fb([{"finding_id": "F-11112222",
+                                  "classification": "not meaningful",
+                                  "comment": "noise row, ignore"}])),
+                encoding="utf-8")
+    result = feedback.ingest(p, run, pkg)
+    assert len(result["cases"]) == 1
+    assert len(result["candidates"]) == 1
+    cand = json.loads(next((pkg / "rules" / "candidates").glob("RL-*.json"))
+                      .read_text(encoding="utf-8"))
+    assert cand["category"] == "ignore-field"

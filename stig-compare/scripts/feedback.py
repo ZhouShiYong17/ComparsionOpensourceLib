@@ -3,6 +3,7 @@
 candidate rule draft awaiting the Task 14 review gate."""
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -15,13 +16,31 @@ PKG_ROOT = Path(__file__).resolve().parent.parent
 _RULE_MAPPING = {"wrong match": "matching-key", "not meaningful": "ignore-field"}
 
 # Fields a company row may carry (see candidates._ROW_TEXT_FIELDS and
-# pipeline._COMPANY_NORM_FIELDS). Used only to detect whether a "not
+# pipeline._COMPANY_NORM_FIELDS), other than the default ignore-field target
+# (observed_value_or_evidence). Used only to detect whether a "not
 # meaningful" comment names a field other than the default ignore target,
 # in which case drafting an ignore-field candidate would be a guess and is
-# skipped instead.
-_ROW_FIELDS = ["stig_description", "stig_objective_or_requirement",
-              "stig_command_or_value", "company_approved_setting_or_expected_value",
-              "observed_value_or_evidence"]
+# skipped instead. Each field maps to its snake_case identifier plus the
+# natural-language aliases a human reviewer is likely to type instead of the
+# raw field name -- a raw substring/identifier match alone is near-inert on
+# free text (spec review finding: "the description" doesn't contain
+# "stig_description").
+_FIELD_ALIASES = {
+    "stig_description": ["stig_description", "description"],
+    "stig_objective_or_requirement": [
+        "stig_objective_or_requirement", "objective", "requirement"],
+    "stig_command_or_value": [
+        "stig_command_or_value", "command", "verification method",
+        "check command"],
+    "company_approved_setting_or_expected_value": [
+        "company_approved_setting_or_expected_value", "approved setting",
+        "expected value", "baseline"],
+    "context_grouping": ["context_grouping", "group", "grouping", "category"],
+}
+
+_OTHER_FIELD_PATTERNS = [
+    re.compile(r"\b" + re.escape(alias) + r"\b", re.IGNORECASE)
+    for aliases in _FIELD_ALIASES.values() for alias in aliases]
 
 
 def _expected_for(classification, finding):
@@ -66,8 +85,8 @@ def _build_snapshot(finding, manifest):
 
 
 def _comment_names_other_field(comment):
-    text = (comment or "").lower()
-    return any(f in text for f in _ROW_FIELDS if f != "observed_value_or_evidence")
+    text = comment or ""
+    return any(p.search(text) for p in _OTHER_FIELD_PATTERNS)
 
 
 def _candidate_draft(classification, comment, finding, snapshot, fb_id):

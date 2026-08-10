@@ -235,10 +235,6 @@ def _context_for_row(row, doc_type, field=""):
             "field": field}
 
 
-def _finding_id(row_id, rule_id, finding_type):
-    return common.finding_id(row_id, rule_id, finding_type or "deterministic")
-
-
 def _ensure_match_fields(m):
     """Backfill pipeline-tracked bookkeeping fields onto a match_state record.
 
@@ -259,13 +255,15 @@ def _ensure_match_fields(m):
     return m
 
 
-def _build_finding(row_id, rule_id, verdict, basis, deterministic, finding_type,
-                    observation, interpretation, applied_rules_list,
-                    match_row, company_row, official_rule,
-                    approved_alignment=None):
+def _build_finding(record_id, row_id, rule_id, verdict, basis, deterministic,
+                    finding_type, observation, interpretation,
+                    applied_rules_list, match_row, company_record,
+                    official_rule, approved_alignment=None):
     return {
-        "finding_id": _finding_id(row_id, rule_id, finding_type),
-        "row_id": row_id, "rule_id": rule_id, "verdict": verdict,
+        "finding_id": common.finding_id(record_id, rule_id,
+                                        finding_type or "deterministic"),
+        "record_id": record_id, "row_id": row_id, "rule_id": rule_id,
+        "verdict": verdict,
         "finding_type": finding_type, "deterministic": deterministic,
         "basis": basis, "observation": observation,
         "interpretation": interpretation, "skeptic": None,
@@ -274,8 +272,8 @@ def _build_finding(row_id, rule_id, verdict, basis, deterministic, finding_type,
         "approved_alignment": approved_alignment,
         "match": {"tier": match_row["tier"], "candidates": match_row["candidates"]},
         "company_row": {
-            "original_company_text": company_row.get("original_company_text", ""),
-            "source_reference": company_row.get("source_reference", {})},
+            "original_company_text": company_record.get("original_company_text", ""),
+            "source_reference": company_record.get("source_reference", {})},
         "official_rule": {
             "rule_id": official_rule.get("rule_id", rule_id),
             "title": official_rule.get("title", ""),
@@ -285,72 +283,77 @@ def _build_finding(row_id, rule_id, verdict, basis, deterministic, finding_type,
     }
 
 
-def _run_deterministic_verdicts(registry, doc_type, match_state, rows_by_id,
-                                 rules_by_id):
-    """Compute deterministic verdicts / semantic hand-off for every matched
-    row (tier in T0/T1/T2) that hasn't had this done yet (m["verdict_done"]
-    is falsy). Mutates each match_state record in place (sets verdict_done,
-    may append a warning) and is therefore idempotent: calling it again once
-    every matched row has been processed is a no-op.
+def _run_deterministic_verdicts(registry, doc_type, match_state,
+                                records_by_id, rules_by_id):
+    """Compute deterministic verdicts / semantic hand-off for every
+    (record, rule_id) pair produced by a matched record (tier in T0/T1/T2)
+    that hasn't had this done yet (rule_id not in m["verdict_done_rules"]).
+    A record can carry more than one matched_rule_ids entry (multi-select
+    matching), so this iterates pairs, not records. Mutates each match_state
+    record in place (appends to verdict_done_rules, may append a warning)
+    and is therefore idempotent: calling it again once every pair has been
+    processed is a no-op.
 
     Shared by cmd_resolve (immediately after a fresh matching pass) and
-    cmd_finalize (closes the gap where a row was matched -- e.g. a T0/T1
+    cmd_finalize (closes the gap where a record was matched -- e.g. a T0/T1
     raw-text match already assigned during `start` -- but `resolve` was
-    never called before `finalize`; previously that left matched-row counts
-    in coverage with no corresponding finding and no warning).
+    never called before `finalize`; previously that left matched-record
+    counts in coverage with no corresponding finding and no warning).
 
     Returns (new_findings, new_semantic_requests).
     """
     new_findings = []
     new_semantic_requests = []
     for m in match_state:
-        if m["tier"] not in _MATCHED_TIERS or not m.get("matched_rule_id"):
+        if m["tier"] not in _MATCHED_TIERS or not m.get("matched_rule_ids"):
             continue
-        if m.get("verdict_done"):
-            continue
-        row_id = m["row_id"]
-        row = rows_by_id.get(row_id)
-        rule_id = m["matched_rule_id"]
-        rule = rules_by_id.get(rule_id)
-        if row is None or rule is None:
-            # Matched to a rule_id that doesn't resolve to a real official rule
-            # (state corruption / shortlist-registry mismatch): never leave
-            # this silently unprocessed forever -- flag it and stop retrying.
-            m["verdict_done"] = True
-            m["warnings"].append("unknown-matched-rule")
-            continue
-        context = _context_for_row(row, doc_type, field="expected_value")
-        applied, _ = rules_mod.applicable_rules(registry, context)
-        observed_raw = row.get("observed_value_or_evidence", "")
-        expected_raw = rule.get("expected_value", "")
-        eq_rule_id = None
-        if common.fold_ws(observed_raw):
-            # The equivalence shortcut must never override the missing-
-            # evidence hard rule: only consult it when there is evidence.
-            eq_rule_id = rules_mod.equivalent_by_rule(applied, observed_raw,
-                                                       expected_raw)
-        applied_rules_list = []
-        if eq_rule_id:
-            result = {"verdict": "Compliant", "basis": "rule-equivalence",
-                      "deterministic": True, "approved_alignment": None,
-                      "observation": {"observed": observed_raw,
-                                      "expected": expected_raw}}
-            applied_rules_list = [eq_rule_id]
-        else:
-            result = compare_values.deterministic_verdict(row, rule)
-
-        m["verdict_done"] = True
-        if result is not None:
-            finding = _build_finding(
-                row_id, rule_id, result["verdict"], result["basis"],
-                result["deterministic"], None, result["observation"], None,
-                applied_rules_list, m, row, rule,
-                approved_alignment=result.get("approved_alignment"))
-            new_findings.append(finding)
-        else:
-            new_semantic_requests.append(
-                {"row_id": row_id, "rule_id": rule_id, "row": row, "rule": rule,
-                 "instructions_file": "prompts/semantic_compare.md"})
+        record = records_by_id.get(m["record_id"])
+        for rule_id in m["matched_rule_ids"]:
+            if rule_id in m["verdict_done_rules"]:
+                continue
+            rule = rules_by_id.get(rule_id)
+            if record is None or rule is None:
+                # Matched to a rule_id that doesn't resolve to a real
+                # official rule (state corruption / shortlist-registry
+                # mismatch): never leave this silently unprocessed forever
+                # -- flag it and stop retrying.
+                m["verdict_done_rules"].append(rule_id)
+                m["warnings"].append("unknown-matched-rule")
+                continue
+            context = _context_for_row(record, doc_type,
+                                       field="expected_value")
+            applied, _ = rules_mod.applicable_rules(registry, context)
+            observed_raw = record.get("observed_value_or_evidence", "")
+            expected_raw = rule.get("expected_value", "")
+            eq_rule_id = None
+            if common.fold_ws(observed_raw):
+                # The equivalence shortcut must never override the missing-
+                # evidence hard rule: only consult it when there is evidence.
+                eq_rule_id = rules_mod.equivalent_by_rule(
+                    applied, observed_raw, expected_raw)
+            applied_rules_list = []
+            if eq_rule_id:
+                result = {"verdict": "Compliant",
+                          "basis": "rule-equivalence",
+                          "deterministic": True, "approved_alignment": None,
+                          "observation": {"observed": observed_raw,
+                                          "expected": expected_raw}}
+                applied_rules_list = [eq_rule_id]
+            else:
+                result = compare_values.deterministic_verdict(record, rule)
+            m["verdict_done_rules"].append(rule_id)
+            if result is not None:
+                new_findings.append(_build_finding(
+                    m["record_id"], record["row_id"], rule_id,
+                    result["verdict"], result["basis"],
+                    result["deterministic"], None, result["observation"],
+                    None, applied_rules_list, m, record, rule,
+                    approved_alignment=result.get("approved_alignment")))
+            else:
+                new_semantic_requests.append(
+                    {"record_id": m["record_id"], "rule_id": rule_id,
+                     "record": record, "rule": rule,
+                     "instructions_file": "prompts/semantic_compare.md"})
     return new_findings, new_semantic_requests
 
 
@@ -605,22 +608,7 @@ def cmd_resolve(args):
     match_state = list(state_by_id.values())
 
     # ---- matching pass -----------------------------------------------------
-    # NOTE: temporary shim for Task 12 -- this pass, and the shortlist/
-    # request shape it builds on retry/reject, still use the OLD single-
-    # select match_state fields (matched_rule_id/row_quote/rule_quote) and
-    # the OLD {"row_id", "row", ...} matching-request shape, not the multi-
-    # match shape _ensure_match_fields/_matching_request now produce. It is
-    # only kept alive here (with rows_by_id -> records_by_id swapped in) so
-    # the module stays importable; Task 12 rewrites it for the multi-match
-    # shape.
-    # matching_requests.jsonl now holds a mix of OLD-shape ("row_id") and
-    # NEW-shape (_matching_request: "record_id") entries -- tolerate both so
-    # a canonicalize-pass-generated entry never raises KeyError here.
-    # _pending_ids() intersects against state_by_id (keyed by record_id for
-    # new-shape state), so an old-shape row_id simply never matches a
-    # pending record -- this keeps the shim inert.
-    requested_ids = {r.get("record_id", r.get("row_id"))
-                     for r in matching_requests_all}
+    requested_ids = {r["record_id"] for r in matching_requests_all}
     matching_ok = 0
     matching_rejected_final = 0
     no_such_request = 0
@@ -641,17 +629,17 @@ def cmd_resolve(args):
                 _mk_failure(None, "matching", [parse_err], raw_line))
             continue
 
-        rid = resp.get("row_id") if isinstance(resp.get("row_id"), str) else None
+        rid = resp.get("record_id") if isinstance(resp.get("record_id"), str) \
+            else None
         if rid is None or rid not in _pending_ids():
             no_such_request += 1
             validation_failures_new.append(
                 _mk_failure(rid, "matching", ["no-such-request"], resp))
             continue
         m = state_by_id[rid]
-        row = records_by_id.get(rid)
-        bad_types = _type_guard(
-            resp, ["decision", "rule_id", "row_quote", "rule_quote", "basis"],
-            ["ambiguous_rule_ids"])
+        record = records_by_id.get(rid)
+        bad_types = _type_guard(resp, ["decision", "basis"],
+                                ["selections", "ambiguous_rule_ids"])
         if bad_types:
             # A malformed field (wrong type) is invalid Claude output, not a
             # crash -- it goes through the same retry-then-reject protocol
@@ -660,7 +648,8 @@ def cmd_resolve(args):
             errs = ["malformed-response"]
         else:
             shortlist_ids = [c["rule_id"] for c in m["candidates"]]
-            errs = validate.validate_match_output(resp, shortlist_ids, row, rules_by_id)
+            errs = validate.validate_match_output(
+                resp, shortlist_ids, record, rules_by_id)
         if errs:
             m["match_failures"] += 1
             m["retried"] = True
@@ -671,12 +660,9 @@ def cmd_resolve(args):
                 m["tier"] = "T4"
                 m["warnings"].append("llm-output-rejected")
             else:
-                rules_for_req = [rules_by_id[c["rule_id"]] | {"_score": c["score"]}
-                                 for c in m["candidates"]]
-                new_matching_requests.append(
-                    {"row_id": rid, "row": row, "candidates": rules_for_req,
-                     "instructions_file": "prompts/matching.md", "retry": True,
-                     "previous_errors": errs})
+                new_matching_requests.append(_matching_request(
+                    record, m, rules_by_id,
+                    extra={"retry": True, "previous_errors": errs}))
             continue
 
         decision = resp["decision"]
@@ -687,30 +673,30 @@ def cmd_resolve(args):
             m["tier"] = "T3"
             m["ambiguous_rule_ids"] = resp["ambiguous_rule_ids"]
         else:  # match
-            chosen_id = resp["rule_id"]
+            sels = resp["selections"]
             downgraded = False
-            if m.get("margin_flag") and len(m["candidates"]) >= 2:
+            if m.get("margin_flag") and len(sels) == 1 and \
+                    len(m["candidates"]) >= 2:
+                chosen_id = sels[0]["rule_id"]
                 runner_up = next((c for c in m["candidates"]
                                   if c["rule_id"] != chosen_id), None)
                 if runner_up is not None:
                     runner_rule = rules_by_id.get(runner_up["rule_id"])
                     if runner_rule and validate.quote_exists(
-                            resp["rule_quote"], _rule_text(runner_rule)):
+                            sels[0]["rule_quote"], _rule_text(runner_rule)):
                         downgraded = True
                         m["tier"] = "T3"
-                        m["ambiguous_rule_ids"] = [chosen_id, runner_up["rule_id"]]
+                        m["ambiguous_rule_ids"] = [chosen_id,
+                                                   runner_up["rule_id"]]
             if not downgraded:
                 m["tier"] = "T2"
-                m["matched_rule_id"] = chosen_id
-                m["row_quote"] = resp["row_quote"]
-                m["rule_quote"] = resp["rule_quote"]
+                m["matched_rule_ids"] = [s["rule_id"] for s in sels]
+                m["row_quotes"] = {s["rule_id"]: s["row_quote"]
+                                   for s in sels}
+                m["rule_quotes"] = {s["rule_id"]: s["rule_quote"]
+                                    for s in sels}
 
     # ---- deterministic verdict / semantic hand-off -------------------------
-    # NOTE: temporary shim for Task 12 -- _run_deterministic_verdicts still
-    # reads the OLD singular m["matched_rule_id"] (unset by the new
-    # _ensure_match_fields, which only sets "matched_rule_ids"), so it is a
-    # guarded no-op for every record produced by this task's passes; only
-    # rows_by_id -> records_by_id is swapped in at the call site.
     new_findings, new_semantic_requests = _run_deterministic_verdicts(
         registry, doc_type, match_state, records_by_id, rules_by_id)
 
@@ -768,8 +754,17 @@ def cmd_finalize(args):
     registry = rules_mod.load_registry(PKG_ROOT / "rules" / "registry.json")
     doc_type = Path(manifest["company_file"]).suffix.lstrip(".").lower()
 
-    company_rows = common.read_jsonl(run_dir / "company_rows.jsonl")
-    rows_by_id = {r["row_id"]: r for r in company_rows}
+    # NOTE: minimal Task 12 load-shape change -- company_records.jsonl /
+    # records_by_id (record_id-keyed) replace the old company_rows.jsonl /
+    # rows_by_id so this call site can pass _run_deterministic_verdicts its
+    # new required argument. The rest of finalize below this point (e.g.
+    # state_by_id's row_id keying, and every other rows_by_id/company_rows
+    # reference further down) is still on the OLD row-keyed shape and is
+    # left broken here on purpose -- propagating record_id through the rest
+    # of finalize (dedup, coverage, unmatched/ambiguous bucketing, etc.) is
+    # Task 14's job.
+    company_records = common.read_jsonl(run_dir / "company_records.jsonl")
+    records_by_id = {r["record_id"]: r for r in company_records}
     official_rules = common.read_jsonl(run_dir / "official_rules.jsonl")
     rules_by_id = {r["rule_id"]: r for r in official_rules}
 
@@ -779,15 +774,15 @@ def cmd_finalize(args):
     state_by_id = {m["row_id"]: m for m in match_state}
 
     # ---- deterministic verdict / semantic hand-off -------------------------
-    # Closes the gap where a row was matched (e.g. a T0/T1 raw-text match
+    # Closes the gap where a record was matched (e.g. a T0/T1 raw-text match
     # already assigned during `start`) but `resolve` was never called before
-    # `finalize`: without this, a matched row could reach final.json with no
-    # corresponding finding and no warning. Idempotent (guarded by each
-    # match_state record's verdict_done) so calling this on every `finalize`
-    # -- even after `resolve` already ran it -- is a safe no-op for rows
-    # already processed.
+    # `finalize`: without this, a matched record could reach final.json with
+    # no corresponding finding and no warning. Idempotent (guarded by each
+    # match_state record's verdict_done_rules) so calling this on every
+    # `finalize` -- even after `resolve` already ran it -- is a safe no-op
+    # for pairs already processed.
     verdict_findings_new, verdict_semantic_requests_new = _run_deterministic_verdicts(
-        registry, doc_type, match_state, rows_by_id, rules_by_id)
+        registry, doc_type, match_state, records_by_id, rules_by_id)
 
     consumed = _load_consumed(run_dir)
     consumed_semantic = set(consumed["semantic"])

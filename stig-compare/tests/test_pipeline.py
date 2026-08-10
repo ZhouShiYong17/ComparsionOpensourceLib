@@ -745,3 +745,63 @@ def test_build_table_records_separator_continuation_split():
     assert ts["parent_of"] == {"3": 2}
     assert ts["row_dispositions"] == {"1": "separator", "2": "record",
                                       "3": "continuation"}
+
+
+# --------------------------------------------------------------------------
+# Task 12: multi-select matching pass and per-pair deterministic verdicts
+# --------------------------------------------------------------------------
+
+def _match_answer(req, rule_ids):
+    if not rule_ids:
+        return {"record_id": req["record_id"], "decision": "none",
+                "selections": [], "ambiguous_rule_ids": [], "basis": "none"}
+    sels = []
+    for rid in rule_ids:
+        rule = next(c for c in req["candidates"] if c["rule_id"] == rid)
+        sels.append({"rule_id": rid,
+                     "row_quote": req["record"]["original_company_text"]
+                     .split(" | ")[0],
+                     "rule_quote": rule["title"]})
+    return {"record_id": req["record_id"], "decision": "match",
+            "selections": sels, "ambiguous_rule_ids": [], "basis": "content"}
+
+
+def test_multi_select_match_produces_pair_findings(tmp_path, fixture_paths):
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    _answer_extraction(run_dir)
+
+    m_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    answers = []
+    for req in m_reqs:
+        # NOTE: the fixture's "password reuse" row is auto-tiered to T1 by
+        # candidates.generate()'s technical-token uniqueness check (its raw
+        # text uniquely overlaps V-1001's "password_reuse_max"/"PARAMETER"
+        # tokens) before it ever reaches a matching request, so it can never
+        # be the row this test picks 2 selections for. Any record that
+        # reaches this pass with >= 2 shortlisted candidates works just as
+        # well to exercise multi-select.
+        cand_ids = [c["rule_id"] for c in req["candidates"]]
+        picks = cand_ids[:2] if len(cand_ids) >= 2 else cand_ids[:1]
+        answers.append(_match_answer(req, picks))
+    common.write_jsonl(run_dir / "matching_responses.jsonl", answers)
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+    match_state = common.read_jsonl(run_dir / "match_state.jsonl")
+    multi = [m for m in match_state if len(m["matched_rule_ids"]) == 2]
+    assert multi, "expected at least one two-rule match"
+    findings = common.read_jsonl(run_dir / "findings.jsonl")
+    sem_reqs = (common.read_jsonl(run_dir / "semantic_requests.jsonl")
+                if (run_dir / "semantic_requests.jsonl").exists() else [])
+    m0 = multi[0]
+    covered = {f["rule_id"] for f in findings
+               if f["record_id"] == m0["record_id"]} | \
+              {r["rule_id"] for r in sem_reqs
+               if r["record_id"] == m0["record_id"]}
+    assert covered == set(m0["matched_rule_ids"])
+    for f in findings:
+        assert "record_id" in f and "row_id" in f

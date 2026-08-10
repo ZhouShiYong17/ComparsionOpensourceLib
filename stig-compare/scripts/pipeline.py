@@ -155,6 +155,79 @@ def _rule_text(rule):
                      rule.get("fix_text", "")])
 
 
+def _extra_fields_for(table, column_mapping, row):
+    header = table["header_row"]
+    out = {}
+    for k, target in column_mapping.items():
+        if target != "extra_field":
+            continue
+        i = int(k)
+        val = row["cells"][i] if i < len(row["cells"]) else ""
+        if common.fold_ws(val):
+            name = header[i] if i < len(header) and \
+                common.fold_ws(str(header[i])) else f"col{i}"
+            out[str(name)] = common.fold_ws(val)
+    return out
+
+
+def _build_table_records(table, ts):
+    """Walk a fully-canonicalized table's stored chunk entries in row order
+    and build canonical records. Mutates ts (row_dispositions, parent_of).
+    Returns the new records. Belt-and-braces: rows the validator somehow
+    never saw become extraction-failed records via canonical.reconcile."""
+    rows_by_index = {r["row_index"]: r for r in table["rows"]}
+    entries = []
+    for chunk in ts["chunks"].values():
+        entries.extend(chunk.get("entries", []))
+    entries.sort(key=lambda e: e["row_index"])
+
+    records = []
+    current_context = ts["context_grouping"]
+    last_record_row = None
+    for entry in entries:
+        ri = entry["row_index"]
+        disp = entry["disposition"]
+        ts["row_dispositions"][str(ri)] = disp
+        if disp == "separator":
+            st = common.fold_ws(entry.get("separator_text", ""))
+            current_context = ts["context_grouping"] + \
+                (" | " + st if st else "")
+            continue
+        if disp == "continuation":
+            if last_record_row is None:
+                ts["row_dispositions"][str(ri)] = "record"
+                records.append(canonical.failed_record(
+                    table, rows_by_index[ri], "orphan-continuation"))
+            else:
+                ts["parent_of"][str(ri)] = last_record_row
+            continue
+        last_record_row = ri
+        for rec_resp in entry["records"]:
+            records.append(canonical.build_record(
+                table, rows_by_index[ri], rec_resp["sub_index"],
+                rec_resp["fields"], rec_resp["field_provenance"],
+                _extra_fields_for(table, ts["column_mapping"],
+                                  rows_by_index[ri]),
+                rec_resp.get("interpretation_note", ""), current_context))
+    for ri in canonical.reconcile(
+            table, {int(k): v for k, v in ts["row_dispositions"].items()}):
+        ts["row_dispositions"][str(ri)] = "record"
+        records.append(canonical.failed_record(
+            table, rows_by_index[ri], "reconcile-missing"))
+    return records
+
+
+def _matching_request(record, m, rules_by_id, extra=None):
+    req = {"record_id": record["record_id"], "record": record,
+           "candidates": [rules_by_id[c["rule_id"]] | {"_score": c["score"]}
+                          for c in m["candidates"]
+                          if c["rule_id"] in rules_by_id],
+           "instructions_file": "prompts/matching.md"}
+    if extra:
+        req.update(extra)
+    return req
+
+
 def _context_for_row(row, doc_type, field=""):
     return {"document_type": doc_type,
             "sheet_or_section": row.get("source_reference", {}).get(
@@ -169,17 +242,20 @@ def _finding_id(row_id, rule_id, finding_type):
 def _ensure_match_fields(m):
     """Backfill pipeline-tracked bookkeeping fields onto a match_state record.
 
-    candidates.generate() only produces row_id/tier/matched_rule_id/margin_flag
-    /candidates; everything else here is added and persisted by this module.
+    candidates.generate() only produces record_id/tier/matched_rule_ids
+    /margin_flag/candidates; everything else here is added and persisted by
+    this module.
     """
+    m.setdefault("matched_rule_ids", [])
     m.setdefault("match_failures", 0)
-    m.setdefault("semantic_failures", 0)
+    m.setdefault("semantic_failures", {})
     m.setdefault("retried", False)
     m.setdefault("warnings", [])
-    m.setdefault("row_quote", None)
-    m.setdefault("rule_quote", None)
+    m.setdefault("row_quotes", {})
+    m.setdefault("rule_quotes", {})
     m.setdefault("ambiguous_rule_ids", [])
-    m.setdefault("verdict_done", False)
+    m.setdefault("verdict_done_rules", [])
+    m.setdefault("sweep_origin_rule_ids", [])
     return m
 
 
@@ -367,92 +443,176 @@ def cmd_resolve(args):
     registry = rules_mod.load_registry(PKG_ROOT / "rules" / "registry.json")
     doc_type = Path(manifest["company_file"]).suffix.lstrip(".").lower()
 
-    company_rows = common.read_jsonl(run_dir / "company_rows.jsonl")
-    rows_by_id = {r["row_id"]: r for r in company_rows}
+    skel = json.loads((run_dir / "skeleton.json").read_text(encoding="utf-8"))
+    tables_by_index = {t["table_index"]: t for t in skel["tables"]}
+    table_state = _read_jsonl_opt(run_dir / "table_state.jsonl")
+    tstate_by_index = {t["table_index"]: t for t in table_state}
+    company_records = _read_jsonl_opt(run_dir / "company_records.jsonl")
+    records_by_id = {r["record_id"]: r for r in company_records}
     official_rules = common.read_jsonl(run_dir / "official_rules.jsonl")
     rules_by_id = {r["rule_id"]: r for r in official_rules}
 
     match_state = common.read_jsonl(run_dir / "match_state.jsonl")
     for m in match_state:
         _ensure_match_fields(m)
-    state_by_id = {m["row_id"]: m for m in match_state}
+    state_by_id = {m["record_id"]: m for m in match_state}
 
     consumed = _load_consumed(run_dir)
-    consumed_structuring = set(consumed["structuring"])
     consumed_matching = set(consumed["matching"])
 
     matching_requests_all = _read_jsonl_opt(run_dir / "matching_requests.jsonl")
     validation_failures_new = []
     new_matching_requests = []
 
-    # ---- structuring pass ------------------------------------------------
-    structuring_ok = 0
-    structuring_failed = 0
-    for raw_line in _read_response_lines(run_dir / "structuring_responses.jsonl"):
-        fp = _fingerprint(raw_line)
-        if fp in consumed_structuring:
-            continue                      # already-consumed replay -> no-op
-        consumed_structuring.add(fp)
+    # ---- table-mapping pass ---------------------------------------------
+    consumed_mapping = set(consumed["table_mapping"])
+    consumed_canon = set(consumed["canonicalize"])
+    mapping_requests_all = _read_jsonl_opt(
+        run_dir / "table_mapping_requests.jsonl")
+    mapping_req_by_index = {r["table_index"]: r for r in mapping_requests_all}
+    new_mapping_requests = []
+    new_canon_requests = []
+    mapping_ok = mapping_failed_final = 0
 
+    for raw_line in _read_response_lines(
+            run_dir / "table_mapping_responses.jsonl"):
+        fp = _fingerprint(raw_line)
+        if fp in consumed_mapping:
+            continue
+        consumed_mapping.add(fp)
         resp, parse_err = _parse_response_line(raw_line)
         if parse_err:
             validation_failures_new.append(
-                _mk_failure(None, "structuring", [parse_err], raw_line))
+                _mk_failure(None, "table_mapping", [parse_err], raw_line))
             continue
-
-        rid = resp.get("row_id") if isinstance(resp.get("row_id"), str) else None
-        row = rows_by_id.get(rid) if rid else None
-        if row is None or row.get("status") != "needs-structuring":
+        tix = resp.get("table_index")
+        ts = tstate_by_index.get(tix) if isinstance(tix, int) else None
+        if ts is None or ts["classification"] is not None:
             validation_failures_new.append(
-                _mk_failure(rid, "structuring", ["no-such-request"], resp))
+                _mk_failure(None, "table_mapping", ["no-such-request"], resp))
             continue
-
-        present = [k for k in _STRUCT_FIELDS if k in resp]
-        bad_types = _type_guard(resp, present)
-        if bad_types:
-            # A malformed field (wrong type) is treated the same as an
-            # unverifiable quote: this response is invalid input, not a
-            # crash. Structuring has no multi-strike retry, so it goes
-            # straight to extraction-failed like any other rejection.
-            codes = ["malformed-response"]
-        else:
-            codes = [] if present else ["no-fields-extracted"]
-            for k in present:
-                if not validate.quote_exists(resp[k], row.get("original_company_text", "")):
-                    codes.append(f"not-verbatim:{k}")
-        if codes:
-            structuring_failed += 1
-            row["status"] = "extraction-failed"
-            row["notes"] = "structuring-rejected:" + ",".join(codes)
+        errs = validate.validate_table_mapping_output(
+            resp, tables_by_index[tix])
+        if errs:
+            ts["mapping_failures"] += 1
             validation_failures_new.append(
-                _mk_failure(rid, "structuring", codes, resp))
+                _mk_failure(None, "table_mapping", errs, resp))
+            if ts["mapping_failures"] >= 2:
+                ts["classification"] = "mapping-failed"
+                mapping_failed_final += 1
+            else:
+                new_mapping_requests.append(dict(
+                    mapping_req_by_index[tix], retry=True,
+                    previous_errors=errs))
             continue
+        mapping_ok += 1
+        ts["classification"] = resp["classification"]
+        ts["irrelevant_reason"] = resp["irrelevant_reason"]
+        ts["column_mapping"] = resp["column_mapping"]
+        ts["context_grouping"] = common.fold_ws(resp["context_grouping"])
+        if ts["classification"] in ("stig_relevant", "uncertain"):
+            table = tables_by_index[tix]
+            for ci, chunk in enumerate(canonical.chunk_rows(table["rows"])):
+                chunk_id = f"T{tix}-C{ci}"
+                ts["chunks"][chunk_id] = {
+                    "row_indexes": [r["row_index"] for r in chunk],
+                    "done": False, "failures": 0, "entries": []}
+                new_canon_requests.append({
+                    "chunk_id": chunk_id, "table_index": tix,
+                    "context_grouping": ts["context_grouping"],
+                    "column_mapping": ts["column_mapping"],
+                    "header_row": table["header_row"], "rows": chunk,
+                    "instructions_file": "prompts/canonicalize.md"})
 
-        structuring_ok += 1
-        for k in present:
-            row[k] = resp[k]
-        row["status"] = "ok"
-        row["notes"] = ""
-        # The row's "normalized" cache (built once in cmd_start) is now stale
-        # for the fields Claude just filled in -- refresh it in place rather
-        # than leave a misleading pre-structuring snapshot on disk.
-        normalize.add_normalized([row], _COMPANY_NORM_FIELDS)
-        # regenerate this row's tier/candidates now that fields are populated
-        regen = candidates_mod.generate([row], official_rules)
-        if regen:
-            new_m = _ensure_match_fields(regen[0])
-            state_by_id[rid] = new_m
-            if new_m["tier"] is None and new_m["candidates"]:
-                rules_for_req = [rules_by_id[c["rule_id"]] | {"_score": c["score"]}
-                                 for c in new_m["candidates"]]
-                new_matching_requests.append(
-                    {"row_id": rid, "row": row, "candidates": rules_for_req,
-                     "instructions_file": "prompts/matching.md"})
+    # ---- canonicalize pass ------------------------------------------------
+    canon_req_by_id = {r["chunk_id"]: r for r in
+                       _read_jsonl_opt(run_dir / "canonicalize_requests.jsonl")}
+    canon_ok = canon_failed_final = 0
+    new_records = []
 
-    # rebuild match_state list (preserve any newly-added regenerated rows)
+    def _chunk_state(chunk_id):
+        for ts in table_state:
+            if chunk_id in ts.get("chunks", {}):
+                return ts, ts["chunks"][chunk_id]
+        return None, None
+
+    for raw_line in _read_response_lines(
+            run_dir / "canonicalize_responses.jsonl"):
+        fp = _fingerprint(raw_line)
+        if fp in consumed_canon:
+            continue
+        consumed_canon.add(fp)
+        resp, parse_err = _parse_response_line(raw_line)
+        if parse_err:
+            validation_failures_new.append(
+                _mk_failure(None, "canonicalize", [parse_err], raw_line))
+            continue
+        cid = resp.get("chunk_id") if isinstance(resp.get("chunk_id"), str) \
+            else None
+        ts, chunk = _chunk_state(cid) if cid else (None, None)
+        if chunk is None or chunk["done"]:
+            validation_failures_new.append(
+                _mk_failure(None, "canonicalize", ["no-such-request"], resp))
+            continue
+        table = tables_by_index[ts["table_index"]]
+        errs = validate.validate_canonicalize_output(
+            resp, table, chunk["row_indexes"])
+        if errs:
+            chunk["failures"] += 1
+            validation_failures_new.append(
+                _mk_failure(None, "canonicalize", errs, resp))
+            if chunk["failures"] >= 2:
+                chunk["done"] = True
+                canon_failed_final += 1
+                rows_by_index = {r["row_index"]: r for r in table["rows"]}
+                chunk["entries"] = []
+                for ri in chunk["row_indexes"]:
+                    ts["row_dispositions"][str(ri)] = "record"
+                    new_records.append(canonical.failed_record(
+                        table, rows_by_index[ri], "canonicalize-rejected"))
+            else:
+                new_canon_requests.append(dict(
+                    canon_req_by_id[cid], retry=True, previous_errors=errs))
+            continue
+        canon_ok += 1
+        chunk["done"] = True
+        chunk["entries"] = resp["rows"]
+
+    # tables whose chunks all just completed -> build records + shortlists
+    new_matching_requests_from_canon = []
+    for ts in table_state:
+        chunks = ts.get("chunks", {})
+        if not chunks or ts.get("records_built"):
+            continue
+        if all(c["done"] for c in chunks.values()):
+            table = tables_by_index[ts["table_index"]]
+            built = _build_table_records(table, ts)
+            ts["records_built"] = True
+            normalize.add_normalized(
+                [r for r in built if r["status"] == "ok"],
+                _COMPANY_NORM_FIELDS)
+            new_records.extend(built)
+    if new_records:
+        company_records.extend(new_records)
+        records_by_id.update({r["record_id"]: r for r in new_records})
+        fresh = [r for r in new_records if r["status"] == "ok"]
+        for m in candidates_mod.generate(fresh, official_rules):
+            m = _ensure_match_fields(m)
+            state_by_id[m["record_id"]] = m
+            if m["tier"] is None and m["candidates"]:
+                new_matching_requests_from_canon.append(_matching_request(
+                    records_by_id[m["record_id"]], m, rules_by_id))
     match_state = list(state_by_id.values())
 
     # ---- matching pass -----------------------------------------------------
+    # NOTE: temporary shim for Task 12 -- this pass, and the shortlist/
+    # request shape it builds on retry/reject, still use the OLD single-
+    # select match_state fields (matched_rule_id/row_quote/rule_quote) and
+    # the OLD {"row_id", "row", ...} matching-request shape, not the multi-
+    # match shape _ensure_match_fields/_matching_request now produce. It is
+    # only kept alive here (with rows_by_id -> records_by_id swapped in) so
+    # the module stays importable; Task 12 rewrites it for the multi-match
+    # shape.
     requested_ids = {r["row_id"] for r in matching_requests_all}
     matching_ok = 0
     matching_rejected_final = 0
@@ -481,7 +641,7 @@ def cmd_resolve(args):
                 _mk_failure(rid, "matching", ["no-such-request"], resp))
             continue
         m = state_by_id[rid]
-        row = rows_by_id.get(rid)
+        row = records_by_id.get(rid)
         bad_types = _type_guard(
             resp, ["decision", "rule_id", "row_quote", "rule_quote", "basis"],
             ["ambiguous_rule_ids"])
@@ -539,25 +699,41 @@ def cmd_resolve(args):
                 m["rule_quote"] = resp["rule_quote"]
 
     # ---- deterministic verdict / semantic hand-off -------------------------
+    # NOTE: temporary shim for Task 12 -- _run_deterministic_verdicts still
+    # reads the OLD singular m["matched_rule_id"] (unset by the new
+    # _ensure_match_fields, which only sets "matched_rule_ids"), so it is a
+    # guarded no-op for every record produced by this task's passes; only
+    # rows_by_id -> records_by_id is swapped in at the call site.
     new_findings, new_semantic_requests = _run_deterministic_verdicts(
-        registry, doc_type, match_state, rows_by_id, rules_by_id)
+        registry, doc_type, match_state, records_by_id, rules_by_id)
 
     # ---- persist -------------------------------------------------------
     common.write_jsonl(run_dir / "match_state.jsonl", match_state)
-    common.write_jsonl(run_dir / "company_rows.jsonl", company_rows)
-    _append_jsonl(run_dir / "matching_requests.jsonl", new_matching_requests)
+    common.write_jsonl(run_dir / "table_state.jsonl", table_state)
+    common.write_jsonl(run_dir / "company_records.jsonl", company_records)
+    _append_jsonl(run_dir / "table_mapping_requests.jsonl",
+                  new_mapping_requests)
+    _append_jsonl(run_dir / "canonicalize_requests.jsonl", new_canon_requests)
+    _append_jsonl(run_dir / "matching_requests.jsonl",
+                 new_matching_requests + new_matching_requests_from_canon)
     _append_jsonl(run_dir / "validation_failures.jsonl", validation_failures_new)
     _append_jsonl(run_dir / "findings.jsonl", new_findings)
     _append_jsonl(run_dir / "semantic_requests.jsonl", new_semantic_requests)
-    consumed["structuring"] = sorted(consumed_structuring)
+    consumed["table_mapping"] = sorted(consumed_mapping)
+    consumed["canonicalize"] = sorted(consumed_canon)
     consumed["matching"] = sorted(consumed_matching)
     _save_consumed(run_dir, consumed)
 
     retries_pending = sum(1 for m in match_state
                           if m["tier"] is None and m["match_failures"] == 1)
     semantic_pending_total = len(_read_jsonl_opt(run_dir / "semantic_requests.jsonl"))
-    print(f"resolve: structuring_ok={structuring_ok} "
-          f"structuring_failed={structuring_failed} matching_ok={matching_ok} "
+    canon_pending = sum(1 for ts in table_state
+                        for c in ts.get("chunks", {}).values()
+                        if not c["done"])
+    print(f"resolve: mapping_ok={mapping_ok} "
+          f"mapping_failed={mapping_failed_final} canon_ok={canon_ok} "
+          f"canon_failed={canon_failed_final} canon_pending={canon_pending} "
+          f"matching_ok={matching_ok} "
           f"matching_rejected_final={matching_rejected_final} "
           f"no_such_request={no_such_request} retries_pending={retries_pending} "
           f"new_findings={len(new_findings)} semantic_pending={semantic_pending_total}")

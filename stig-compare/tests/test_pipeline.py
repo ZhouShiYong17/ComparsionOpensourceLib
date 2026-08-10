@@ -19,6 +19,11 @@ def run(tmp_path):
     return run_dir
 
 
+@pytest.fixture(scope="module")
+def fixture_paths(tmp_path_factory):
+    return build_all(tmp_path_factory.mktemp("fx"))
+
+
 def test_start_writes_skeleton_and_mapping_requests(tmp_path):
     fx = build_all(tmp_path / "fx")
     run_dir = tmp_path / "run"
@@ -555,3 +560,172 @@ def test_start_wraps_unreadable_company_file_as_typed_error(tmp_path, capsys):
     assert "pipeline: cannot read file: ValueError" in captured.err
     assert "not a real submission" not in captured.err
     assert "Traceback" not in captured.err
+
+
+# --------------------------------------------------------------------------
+# Task 11: resolve's table-mapping and canonicalize passes
+# --------------------------------------------------------------------------
+
+def _mapping_answer(req, classification="stig_relevant", mapping=None,
+                    reason=""):
+    return {"table_index": req["table_index"],
+            "classification": classification,
+            "irrelevant_reason": reason,
+            "column_mapping": mapping or {},
+            "context_grouping": ""}
+
+
+def _canon_answer(req):
+    """Mechanical fake-Claude: apply the column mapping verbatim."""
+    entries = []
+    for row in req["rows"]:
+        fields, prov = {}, {}
+        empty = True
+        for k, target in req["column_mapping"].items():
+            i = int(k)
+            if target in ("extra_field", "ignore"):
+                continue
+            val = row["cells"][i] if i < len(row["cells"]) else ""
+            if val.strip():
+                empty = False
+                fields[target] = val
+                prov[target] = {"row_index": row["row_index"],
+                                "cell_index": i}
+        if empty:
+            entries.append({"row_index": row["row_index"],
+                            "disposition": "separator",
+                            "separator_text": ""})
+        else:
+            entries.append({"row_index": row["row_index"],
+                            "disposition": "record",
+                            "records": [{"sub_index": 0, "fields": fields,
+                                         "field_provenance": prov,
+                                         "interpretation_note": ""}]})
+    return {"chunk_id": req["chunk_id"], "rows": entries}
+
+
+EX1_MAPPING = {"0": "stig_objective_or_requirement", "1": "stig_description",
+               "2": "stig_command_or_value",
+               "3": "company_approved_setting_or_expected_value"}
+EX2_MAPPING = {"0": "ignore", "1": "stig_command_or_value",
+               "2": "stig_description", "3": "extra_field",
+               "4": "extra_field", "5": "company_compliance_claim",
+               "6": "company_approved_setting_or_expected_value",
+               "7": "company_severity", "8": "observed_value_or_evidence",
+               "9": "remarks_or_justification"}
+
+
+def _answer_extraction(run_dir):
+    """Answer table-mapping for the real fixture, resolve, then answer
+    canonicalize chunks, resolve again. Tables 1-2 irrelevant."""
+    reqs = common.read_jsonl(run_dir / "table_mapping_requests.jsonl")
+    answers = []
+    for r in reqs:
+        if r["table_index"] == 1:
+            answers.append(_mapping_answer(r, "irrelevant",
+                                           reason="general-info"))
+        elif r["table_index"] == 2:
+            answers.append(_mapping_answer(r, "irrelevant",
+                                           reason="instructions"))
+        elif r["table_index"] == 3:
+            answers.append(_mapping_answer(r, mapping=EX1_MAPPING))
+        else:
+            answers.append(_mapping_answer(r, mapping=EX2_MAPPING))
+    common.write_jsonl(run_dir / "table_mapping_responses.jsonl", answers)
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    canon_reqs = common.read_jsonl(run_dir / "canonicalize_requests.jsonl")
+    common.write_jsonl(run_dir / "canonicalize_responses.jsonl",
+                       [_canon_answer(r) for r in canon_reqs])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+
+def test_resolve_builds_canonical_records(tmp_path, fixture_paths):
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    _answer_extraction(run_dir)
+
+    records = common.read_jsonl(run_dir / "company_records.jsonl")
+    assert len(records) == 4          # 2 EX1 rows + 2 EX2 rows
+    ex2 = [r for r in records
+           if r["source_reference"]["table_index"] == 4]
+    dev = next(r for r in ex2 if r["claim_normalized"] == "deviation")
+    assert dev["company_severity"] == "HIGH"
+    assert dev["observed_value_or_evidence"] == "10"
+    assert dev["extra_fields"]["REPORTING yes/no"] == "YES"
+
+    tstate = {t["table_index"]: t
+              for t in common.read_jsonl(run_dir / "table_state.jsonl")}
+    assert tstate[1]["classification"] == "irrelevant"
+    assert tstate[3]["row_dispositions"] == {"1": "record", "2": "record"}
+
+    match_state = common.read_jsonl(run_dir / "match_state.jsonl")
+    assert len(match_state) == 4
+    m_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    assert all("record" in r and "candidates" in r for r in m_reqs)
+
+
+def test_mapping_two_strikes_marks_table_failed(tmp_path, fixture_paths):
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    bad = {"table_index": 1, "classification": "nonsense",
+           "irrelevant_reason": "", "column_mapping": {},
+           "context_grouping": ""}
+    common.write_jsonl(run_dir / "table_mapping_responses.jsonl", [bad])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    reqs = common.read_jsonl(run_dir / "table_mapping_requests.jsonl")
+    assert any(r.get("retry") for r in reqs if r["table_index"] == 1)
+    with open(run_dir / "table_mapping_responses.jsonl", "a",
+              encoding="utf-8") as f:
+        f.write(json.dumps(dict(bad, classification="still-bad")) + "\n")
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    tstate = {t["table_index"]: t
+              for t in common.read_jsonl(run_dir / "table_state.jsonl")}
+    assert tstate[1]["classification"] == "mapping-failed"
+
+
+def test_build_table_records_separator_continuation_split():
+    table = {"table_index": 1, "sheet_or_section": "document-body",
+             "preceding_narrative": "", "header_row": ["A", "B"],
+             "rows": [
+                 {"row_index": 1, "cells": ["SECTION X", ""], "merged": True},
+                 {"row_index": 2, "cells": ["timeout 15", "length 14"],
+                  "merged": False},
+                 {"row_index": 3, "cells": ["continued detail", ""],
+                  "merged": True}]}
+    ts = {"table_index": 1, "classification": "stig_relevant",
+          "irrelevant_reason": "", "column_mapping": {"0": "stig_description"},
+          "context_grouping": "Base", "mapping_failures": 0,
+          "row_dispositions": {}, "parent_of": {},
+          "chunks": {"T1-C0": {"row_indexes": [1, 2, 3], "done": True,
+                               "failures": 0, "entries": [
+              {"row_index": 1, "disposition": "separator",
+               "separator_text": "SECTION X"},
+              {"row_index": 2, "disposition": "record", "records": [
+                  {"sub_index": 0,
+                   "fields": {"stig_description": "timeout 15"},
+                   "field_provenance": {"stig_description":
+                                        {"row_index": 2, "cell_index": 0}},
+                   "interpretation_note": ""},
+                  {"sub_index": 1,
+                   "fields": {"stig_description": "length 14"},
+                   "field_provenance": {"stig_description":
+                                        {"row_index": 2, "cell_index": 1}},
+                   "interpretation_note": ""}]},
+              {"row_index": 3, "disposition": "continuation"}]}}}
+    records = pipeline._build_table_records(table, ts)
+    assert len(records) == 2
+    assert [r["source_reference"]["sub_index"] for r in records] == [0, 1]
+    assert all(r["context_grouping"] == "Base | SECTION X" for r in records)
+    assert records[0]["record_id"] != records[1]["record_id"]
+    assert records[0]["row_id"] == records[1]["row_id"]
+    assert ts["parent_of"] == {"3": 2}
+    assert ts["row_dispositions"] == {"1": "separator", "2": "record",
+                                      "3": "continuation"}

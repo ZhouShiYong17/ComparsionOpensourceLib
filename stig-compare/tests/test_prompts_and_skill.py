@@ -32,3 +32,14 @@ def test_prompts_state_their_schemas():
 def test_prompt_hashes_land_in_versions():
     v = common.load_versions(PKG)
     assert set(PROMPTS) <= set(v["prompt_hashes"])
+
+
+def test_skill_md_orchestration_contract():
+    text = (PKG / "SKILL.md").read_text(encoding="utf-8")
+    assert "name: stig-compare" in text
+    for needle in ["pipeline.py start", "pipeline.py resolve",
+                   "pipeline.py finalize", "structuring_requests.jsonl",
+                   "matching_requests.jsonl", "semantic_requests.jsonl",
+                   "skeptic_responses.jsonl", "feedback.py ingest",
+                   "evaluate_candidate", "Never auto-approve"]:
+        assert needle in text

@@ -668,6 +668,22 @@ def test_resolve_builds_canonical_records(tmp_path, fixture_paths):
     assert all("record" in r and "candidates" in r for r in m_reqs)
 
 
+def test_third_resolve_after_canonicalize_is_noop(tmp_path, fixture_paths):
+    """Regression: once the canonicalize pass appends _matching_request-
+    shaped entries (record_id, no row_id) to matching_requests.jsonl, a
+    later status-check resolve with no new responses of any kind must not
+    crash while building requested_ids from the mixed-shape file."""
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    _answer_extraction(run_dir)
+    # no new responses of any kind: a status-check resolve must not crash
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+
 def test_mapping_two_strikes_marks_table_failed(tmp_path, fixture_paths):
     run_dir = tmp_path / "run"
     assert pipeline.main(["start",

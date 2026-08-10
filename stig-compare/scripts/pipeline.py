@@ -613,7 +613,14 @@ def cmd_resolve(args):
     # only kept alive here (with rows_by_id -> records_by_id swapped in) so
     # the module stays importable; Task 12 rewrites it for the multi-match
     # shape.
-    requested_ids = {r["row_id"] for r in matching_requests_all}
+    # matching_requests.jsonl now holds a mix of OLD-shape ("row_id") and
+    # NEW-shape (_matching_request: "record_id") entries -- tolerate both so
+    # a canonicalize-pass-generated entry never raises KeyError here.
+    # _pending_ids() intersects against state_by_id (keyed by record_id for
+    # new-shape state), so an old-shape row_id simply never matches a
+    # pending record -- this keeps the shim inert.
+    requested_ids = {r.get("record_id", r.get("row_id"))
+                     for r in matching_requests_all}
     matching_ok = 0
     matching_rejected_final = 0
     no_such_request = 0

@@ -117,8 +117,9 @@ def test_semantic_bad_type_and_missing_key():
 
 
 def test_dedup_and_contradictions():
-    f1 = {"finding_id": "F-1", "row_id": "R-1", "rule_id": "V-1",
-          "finding_type": "equivalent", "verdict": "Compliant"}
+    f1 = {"finding_id": "F-1", "record_id": "CR-1", "row_id": "R-1",
+          "rule_id": "V-1", "finding_type": "equivalent",
+          "verdict": "Compliant"}
     f2 = dict(f1, finding_id="F-2")                       # duplicate
     f3 = dict(f1, finding_id="F-3", finding_type="stronger",
               verdict="Non-Compliant")                     # contradicts f1
@@ -128,6 +129,16 @@ def test_dedup_and_contradictions():
     contras = validate.find_contradictions(kept)
     assert contras == [{"finding_ids": ["F-1", "F-3"],
                         "code": "contradictory-verdicts"}]
+
+
+def test_dedup_and_contradictions_key_on_record_id():
+    f1 = {"finding_id": "F-1", "record_id": "CR-a", "row_id": "R-x",
+          "rule_id": "V-1", "finding_type": None, "verdict": "Compliant"}
+    f2 = {"finding_id": "F-2", "record_id": "CR-b", "row_id": "R-x",
+          "rule_id": "V-1", "finding_type": None, "verdict": "Non-Compliant"}
+    kept, dropped = validate.dedup_findings([f1, f2])
+    assert len(kept) == 2 and dropped == []
+    assert validate.find_contradictions(kept) == []
 
 
 

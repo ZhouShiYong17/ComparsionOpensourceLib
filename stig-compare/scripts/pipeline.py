@@ -358,13 +358,15 @@ def _run_deterministic_verdicts(registry, doc_type, match_state,
 
 
 def assign_confidence(match_record, finding, skeptic_outcome):
-    tier = match_record.get("tier")
-    deterministic = bool(finding.get("deterministic"))
     if match_record.get("margin_flag") or match_record.get("retried"):
         return "Low"
-    if tier in ("T0", "T1") and deterministic:
-        return "High"
-    if tier == "T2" and deterministic:
+    deterministic = bool(finding.get("deterministic"))
+    tier = match_record.get("tier")
+    if finding.get("rule_id") in match_record.get("sweep_origin_rule_ids", []):
+        if deterministic or skeptic_outcome == "upheld":
+            return "Medium"
+        return "Low"
+    if tier in ("T0", "T1", "T2") and deterministic:
         return "High"
     if tier == "T2" and not deterministic and skeptic_outcome == "upheld":
         return "Medium"
@@ -841,14 +843,14 @@ def cmd_sweep(args):
 # finalize
 # --------------------------------------------------------------------------
 
-def _ignored_row_ids(registry, company_rows, doc_type):
+def _ignored_row_ids(registry, company_records, doc_type):
     ignored = set()
-    for row in company_rows:
+    for row in company_records:
         context = _context_for_row(row, doc_type, field="")
         applied, _ = rules_mod.applicable_rules(registry, context)
         if any(r["category"] == "ignore-field" and
                r["scope"]["level"] == "sheet-or-section" for r in applied):
-            ignored.add(row["row_id"])
+            ignored.add(row["record_id"])
     return ignored
 
 
@@ -858,16 +860,11 @@ def cmd_finalize(args):
     registry = rules_mod.load_registry(PKG_ROOT / "rules" / "registry.json")
     doc_type = Path(manifest["company_file"]).suffix.lstrip(".").lower()
 
-    # NOTE: minimal Task 12 load-shape change -- company_records.jsonl /
-    # records_by_id (record_id-keyed) replace the old company_rows.jsonl /
-    # rows_by_id so this call site can pass _run_deterministic_verdicts its
-    # new required argument. The rest of finalize below this point (e.g.
-    # state_by_id's row_id keying, and every other rows_by_id/company_rows
-    # reference further down) is still on the OLD row-keyed shape and is
-    # left broken here on purpose -- propagating record_id through the rest
-    # of finalize (dedup, coverage, unmatched/ambiguous bucketing, etc.) is
-    # Task 14's job.
-    company_records = common.read_jsonl(run_dir / "company_records.jsonl")
+    skel = json.loads((run_dir / "skeleton.json").read_text(encoding="utf-8"))
+    table_state = _read_jsonl_opt(run_dir / "table_state.jsonl")
+    tstate_by_index = {t["table_index"]: t for t in table_state}
+    tables_by_index = {t["table_index"]: t for t in skel["tables"]}
+    company_records = _read_jsonl_opt(run_dir / "company_records.jsonl")
     records_by_id = {r["record_id"]: r for r in company_records}
     official_rules = common.read_jsonl(run_dir / "official_rules.jsonl")
     rules_by_id = {r["rule_id"]: r for r in official_rules}
@@ -875,7 +872,7 @@ def cmd_finalize(args):
     match_state = common.read_jsonl(run_dir / "match_state.jsonl")
     for m in match_state:
         _ensure_match_fields(m)
-    state_by_id = {m["row_id"]: m for m in match_state}
+    state_by_id = {m["record_id"]: m for m in match_state}
 
     # ---- deterministic verdict / semantic hand-off -------------------------
     # Closes the gap where a record was matched (e.g. a T0/T1 raw-text match
@@ -894,9 +891,17 @@ def cmd_finalize(args):
     validation_failures = _read_jsonl_opt(run_dir / "validation_failures.jsonl")
     new_validation_failures = []
 
-    # ---- pending matching rows --------------------------------------------
+    # ---- pending table-mapping / canonicalize chunks -----------------------
+    pending_tables = [t["table_index"] for t in table_state
+                      if t["classification"] is None]
+    pending_chunks = [(t["table_index"], cid)
+                      for t in table_state
+                      for cid, c in t.get("chunks", {}).items()
+                      if not c["done"]]
+
+    # ---- pending matching records ------------------------------------------
     matching_requests_all = _read_jsonl_opt(run_dir / "matching_requests.jsonl")
-    matching_requested_ids = {r["row_id"] for r in matching_requests_all}
+    matching_requested_ids = {r["record_id"] for r in matching_requests_all}
     pending_matching_ids = sorted(
         rid for rid in matching_requested_ids
         if state_by_id.get(rid, {}).get("tier") is None)
@@ -904,7 +909,7 @@ def cmd_finalize(args):
     # ---- semantic responses -------------------------------------------
     semantic_requests_all = (_read_jsonl_opt(run_dir / "semantic_requests.jsonl")
                              + verdict_semantic_requests_new)
-    semantic_pairs = {(r["row_id"], r["rule_id"]) for r in semantic_requests_all}
+    semantic_pairs = {(r["record_id"], r["rule_id"]) for r in semantic_requests_all}
     resolved_pairs = set()
     semantic_findings = []
     new_semantic_requests = []
@@ -921,8 +926,10 @@ def cmd_finalize(args):
                 _mk_failure(None, "semantic", [parse_err], raw_line, rule_id=None))
             continue
 
-        rid = resp.get("row_id") if isinstance(resp.get("row_id"), str) else None
-        ruleid = resp.get("rule_id") if isinstance(resp.get("rule_id"), str) else None
+        rid = resp.get("record_id") if isinstance(resp.get("record_id"), str) \
+            else None
+        ruleid = resp.get("rule_id") if isinstance(resp.get("rule_id"), str) \
+            else None
 
         pair = (rid, ruleid)
         if pair not in semantic_pairs or pair in resolved_pairs:
@@ -930,10 +937,10 @@ def cmd_finalize(args):
                 _mk_failure(rid, "semantic", ["no-such-request"], resp,
                            rule_id=ruleid))
             continue
-        row = rows_by_id.get(rid)
+        record = records_by_id.get(rid)
         rule = rules_by_id.get(ruleid)
         m = state_by_id.get(rid)
-        if row is None or rule is None or m is None:
+        if record is None or rule is None or m is None:
             new_validation_failures.append(
                 _mk_failure(rid, "semantic", ["no-such-request"], resp,
                            rule_id=ruleid))
@@ -948,30 +955,34 @@ def cmd_finalize(args):
             # two-strike retry-then-reject protocol.
             errs = ["malformed-response"]
         else:
-            errs = validate.validate_semantic_output(resp, row, rule)
+            errs = validate.validate_semantic_output(resp, record, rule)
         if errs:
-            m["semantic_failures"] += 1
+            n = m["semantic_failures"].get(ruleid, 0) + 1
+            m["semantic_failures"][ruleid] = n
             m["retried"] = True
             new_validation_failures.append(
                 _mk_failure(rid, "semantic", errs, resp, rule_id=ruleid))
-            if m["semantic_failures"] >= 2:
+            if n >= 2:
                 resolved_pairs.add(pair)
                 semantic_findings.append(_build_finding(
-                    rid, ruleid, "Cannot Assess", "llm-output-rejected", False,
-                    None, None, None, [], m, row, rule))
+                    rid, record["row_id"], ruleid, "Cannot Assess",
+                    "llm-output-rejected", False, None, None, None, [], m,
+                    record, rule))
             else:
                 new_semantic_requests.append(
-                    {"row_id": rid, "rule_id": ruleid, "row": row, "rule": rule,
+                    {"record_id": rid, "rule_id": ruleid, "record": record,
+                     "rule": rule,
                      "instructions_file": "prompts/semantic_compare.md",
                      "retry": True, "previous_errors": errs})
             continue
 
         resolved_pairs.add(pair)
         semantic_findings.append(_build_finding(
-            rid, ruleid, resp["verdict"], "semantic-comparison", False,
+            rid, record["row_id"], ruleid, resp["verdict"],
+            "semantic-comparison", False,
             resp["finding_type"], {"row_quote": resp.get("row_quote"),
                                     "rule_quote": resp.get("rule_quote")},
-            resp.get("interpretation"), [], m, row, rule))
+            resp.get("interpretation"), [], m, record, rule))
 
     pending_semantic_pairs = sorted(semantic_pairs - resolved_pairs)
 
@@ -981,12 +992,18 @@ def cmd_finalize(args):
     # abort must not silently discard work already done, or the two-strike
     # retry counter would never advance across repeated `finalize` calls.
     # This also persists this call's deterministic-verdict pass (new
-    # findings + any semantic hand-off it produced, plus the verdict_done /
-    # warnings mutations already carried on state_by_id's match_state
+    # findings + any semantic hand-off it produced, plus the
+    # verdict_done_rules / warnings mutations already carried on
+    # state_by_id's match_state
     # records) for the same reason -- a refusal must not throw that work
     # away, or it would be silently recomputed (or silently lost, if
-    # verdict_done already flipped True) on the next call.
+    # verdict_done_rules already flipped True) on the next call. table_state
+    # / company_records are round-tripped here too so any allow-pending
+    # mutations further below always write from a consistent base and so a
+    # refusal never silently discards bookkeeping.
     common.write_jsonl(run_dir / "match_state.jsonl", list(state_by_id.values()))
+    common.write_jsonl(run_dir / "table_state.jsonl", table_state)
+    common.write_jsonl(run_dir / "company_records.jsonl", company_records)
     _append_jsonl(run_dir / "validation_failures.jsonl", new_validation_failures)
     _append_jsonl(run_dir / "findings.jsonl", verdict_findings_new)
     _append_jsonl(run_dir / "semantic_requests.jsonl",
@@ -995,14 +1012,32 @@ def cmd_finalize(args):
     _save_consumed(run_dir, consumed)
 
     # ---- refusal gate -------------------------------------------------
-    if (pending_matching_ids or pending_semantic_pairs) and not args.allow_pending:
-        print(f"finalize: refused - pending matching={len(pending_matching_ids)} "
+    if (pending_tables or pending_chunks or pending_matching_ids or
+            pending_semantic_pairs) and not args.allow_pending:
+        print(f"finalize: refused - pending mapping={len(pending_tables)} "
+              f"pending canonicalize={len(pending_chunks)} "
+              f"pending matching={len(pending_matching_ids)} "
               f"pending semantic={len(pending_semantic_pairs)} "
               f"(use --allow-pending to force)")
         return 4
 
     passnotrun_findings = []
     if args.allow_pending:
+        for tix in pending_tables:
+            tstate_by_index[tix]["classification"] = "mapping-pass-not-run"
+        for tix, cid in pending_chunks:
+            ts = tstate_by_index[tix]
+            chunk = ts["chunks"][cid]
+            chunk["done"] = True
+            table = tables_by_index[tix]
+            rows_by_index = {r["row_index"]: r for r in table["rows"]}
+            for ri in chunk["row_indexes"]:
+                if str(ri) not in ts["row_dispositions"]:
+                    ts["row_dispositions"][str(ri)] = "record"
+                    rec = canonical.failed_record(
+                        table, rows_by_index[ri], "canonicalize-pass-not-run")
+                    company_records.append(rec)
+                    records_by_id[rec["record_id"]] = rec
         for rid in pending_matching_ids:
             m = state_by_id.get(rid)
             if m is None:
@@ -1012,13 +1047,13 @@ def cmd_finalize(args):
                 m["warnings"].append("matching-pass-not-run")
         for rid, ruleid in pending_semantic_pairs:
             m = state_by_id.get(rid)
-            row = rows_by_id.get(rid)
+            record = records_by_id.get(rid)
             rule = rules_by_id.get(ruleid)
-            if m is None or row is None or rule is None:
+            if m is None or record is None or rule is None:
                 continue
-            f = _build_finding(rid, ruleid, "Cannot Assess",
+            f = _build_finding(rid, record["row_id"], ruleid, "Cannot Assess",
                                 "semantic-pass-not-run", False, None, None,
-                                None, [], m, row, rule)
+                                None, [], m, record, rule)
             f["human_review_needed"] = True
             passnotrun_findings.append(f)
 
@@ -1084,26 +1119,10 @@ def cmd_finalize(args):
     contradictions = validate.find_contradictions(kept)
 
     # ---- coverage --------------------------------------------------------
-    # Rows still stuck in needs-structuring *and never matched* (never
-    # answered, or rejected with no further retry, tier still None) must
-    # land in coverage's needs_structuring_unresolved bucket -- exclude only
-    # those from what coverage sees so `rid not in by_row` is true for them.
-    # candidates.generate() also runs T0/T1 raw-text detection on
-    # needs-structuring rows (so e.g. a row whose raw text quotes a rule id
-    # gets matched before structuring even runs); such a row already has a
-    # matched_rule_id, a real finding, and must be counted as matched here
-    # too -- excluding it unconditionally by status alone would inflate
-    # needs_structuring_unresolved and make coverage.official disagree with
-    # unaddressed_rules (which is computed from the unfiltered match_state).
-    def _needs_structuring_and_unmatched(m):
-        row = rows_by_id.get(m["row_id"], {})
-        return row.get("status") == "needs-structuring" and m["tier"] is None
-
-    match_state_for_coverage = [
-        m for m in match_state if not _needs_structuring_and_unmatched(m)]
-    ignored_row_ids = _ignored_row_ids(registry, company_rows, doc_type)
-    coverage = coverage_mod.compute(company_rows, official_rules,
-                                    match_state_for_coverage, ignored_row_ids)
+    ignored_ids = _ignored_row_ids(registry, company_records, doc_type)
+    coverage = coverage_mod.compute(skel["tables"], tstate_by_index,
+                                    company_records, official_rules,
+                                    match_state, ignored_ids)
     if not coverage["ok"]:
         print(f"finalize: aborted - coverage not ok: {coverage['warnings']}")
         return 3
@@ -1111,29 +1130,44 @@ def cmd_finalize(args):
     # ---- validation-failure and rule-conflict lookups for review flags --
     all_validation_failures = (validation_failures + new_validation_failures +
                                skeptic_malformed)
-    validation_failed_row_ids = {vf["row_id"] for vf in all_validation_failures}
+    validation_failed_record_ids = {vf["row_id"] for vf in all_validation_failures}
     duplicate_rule_ids = set(coverage["official"]["duplicate_coverage_rule_ids"])
     global_conflict = bool(manifest.get("rule_conflicts"))
-    row_conflict_cache = {}
+    record_conflict_cache = {}
 
-    def _row_has_conflict(row_id):
-        if row_id in row_conflict_cache:
-            return row_conflict_cache[row_id]
-        row = rows_by_id.get(row_id)
+    def _record_has_conflict(record_id):
+        if record_id in record_conflict_cache:
+            return record_conflict_cache[record_id]
+        record = records_by_id.get(record_id)
         result = global_conflict
-        if row is not None and not result:
-            context = _context_for_row(row, doc_type, field="")
+        if record is not None and not result:
+            context = _context_for_row(record, doc_type, field="")
             _, conflicts = rules_mod.applicable_rules(registry, context)
             result = bool(conflicts)
-        row_conflict_cache[row_id] = result
+        record_conflict_cache[record_id] = result
         return result
 
-    # ---- confidence + human_review_needed --------------------------------
+    # ---- confidence + claim flags + human_review_needed --------------------
     for f in kept:
-        m = state_by_id.get(f["row_id"], {"tier": None, "margin_flag": False,
-                                          "retried": False})
+        m = state_by_id.get(f["record_id"], {"tier": None, "margin_flag": False,
+                                              "retried": False})
         skeptic_outcome = f["skeptic"]["outcome"] if f.get("skeptic") else None
         f["confidence"] = assign_confidence(m, f, skeptic_outcome)
+
+        record = records_by_id.get(f["record_id"], {})
+        f["company_compliance_claim"] = record.get(
+            "company_compliance_claim", "")
+        f["claim_normalized"] = record.get("claim_normalized", "unknown")
+        f["interpretation_note"] = record.get("interpretation_note", "")
+        flags = []
+        if f["claim_normalized"] == "deviation":
+            flags.append("company-declared-deviation")
+        if f["claim_normalized"] == "comply" and \
+                f.get("verdict") == "Non-Compliant":
+            flags.append("claim-contradicted")
+        f["claim_flags"] = flags
+        f["sweep_originated"] = f["rule_id"] in \
+            m.get("sweep_origin_rule_ids", [])
 
         review = False
         if m.get("tier") == "T3":
@@ -1144,61 +1178,85 @@ def cmd_finalize(args):
                 review = True
         if f.get("rule_id") in duplicate_rule_ids:
             review = True
-        row = rows_by_id.get(f["row_id"], {})
         if f.get("verdict") == "Cannot Assess" and common.fold_ws(
-                row.get("observed_value_or_evidence", "")):
+                record.get("observed_value_or_evidence", "")):
             review = True
-        if f["row_id"] in validation_failed_row_ids:
+        if f["record_id"] in validation_failed_record_ids:
             review = True
-        if _row_has_conflict(f["row_id"]):
+        if _record_has_conflict(f["record_id"]):
+            review = True
+        if flags:
+            review = True
+        if f["sweep_originated"]:
+            review = True
+        if tstate_by_index.get(
+                record.get("source_reference", {}).get("table_index"),
+                {}).get("classification") == "uncertain":
             review = True
         f["human_review_needed"] = review
 
     # ---- leftovers: unmatched / ambiguous / unaddressed -------------------
-    matched_rule_ids = {m["matched_rule_id"] for m in match_state
-                        if m["tier"] in _MATCHED_TIERS and m.get("matched_rule_id")}
     unmatched_rows = []
     ambiguous = []
     for m in match_state:
-        row = rows_by_id.get(m["row_id"])
-        if row is None or row.get("status") != "ok":
+        record = records_by_id.get(m["record_id"])
+        if record is None or record.get("status") != "ok":
             continue
         if m["tier"] == "T3":
             ambiguous.append({
-                "row_id": m["row_id"],
-                "original_company_text": row.get("original_company_text", ""),
-                "source_reference": row.get("source_reference", {}),
+                "record_id": m["record_id"],
+                "original_company_text": record.get("original_company_text", ""),
+                "source_reference": record.get("source_reference", {}),
                 "ambiguous_rule_ids": m.get("ambiguous_rule_ids", []),
                 "candidates": m.get("candidates", [])})
         elif m["tier"] in (None, "T4"):
             unmatched_rows.append({
-                "row_id": m["row_id"],
-                "original_company_text": row.get("original_company_text", ""),
-                "source_reference": row.get("source_reference", {}),
+                "record_id": m["record_id"],
+                "original_company_text": record.get("original_company_text", ""),
+                "source_reference": record.get("source_reference", {}),
                 "warnings": m.get("warnings", [])})
+    matched_rule_ids_union = set().union(
+        *[m["matched_rule_ids"] for m in match_state
+         if m["tier"] in _MATCHED_TIERS] or [set()])
     unaddressed_rules = [
         {"rule_id": r["rule_id"], "title": r.get("title", ""),
          "check_text": r.get("check_text", ""),
          "expected_value": r.get("expected_value", "")}
-        for r in official_rules if r["rule_id"] not in matched_rule_ids]
+        for r in official_rules if r["rule_id"] not in matched_rule_ids_union]
 
-    # Rows that never reached a comparable state at all (still stuck in
-    # needs-structuring with no match, or knocked out to extraction-failed)
-    # -- these are invisible to `unmatched_rows` (which only covers
-    # status=="ok" rows) and to `findings`, so surface them explicitly for
-    # the report/audit trail. A needs-structuring row that raw-text-matched
-    # to T0/T1 (see the coverage note above) already has a finding and is
-    # counted as matched -- it belongs in neither bucket, so it uses the
-    # same "unmatched" condition as match_state_for_coverage.
+    # Records that never reached a comparable state at all (canonicalize
+    # rejected them outright, or an allow-pending chunk was never answered)
+    # are invisible to `unmatched_rows` (which only covers status=="ok"
+    # records) and to `findings` -- surface them explicitly for the
+    # report/audit trail.
     unresolved_rows = [
-        {"row_id": r["row_id"], "status": r.get("status"),
+        {"record_id": r["record_id"], "status": r.get("status"),
          "notes": r.get("notes", ""),
          "source_reference": r.get("source_reference", {}),
          "original_company_text": r.get("original_company_text", "")}
-        for r in company_rows
-        if r.get("status") == "extraction-failed"
-        or (r.get("status") == "needs-structuring" and
-            state_by_id.get(r["row_id"], {}).get("tier") is None)]
+        for r in company_records
+        if r["status"] == "extraction-failed"]
+
+    # ---- table triage -------------------------------------------------
+    table_triage = []
+    triage_warnings = []
+    for t in skel["tables"]:
+        ts = tstate_by_index.get(t["table_index"], {})
+        table_triage.append({
+            "table_index": t["table_index"],
+            "sheet_or_section": t["sheet_or_section"],
+            "classification": ts.get("classification"),
+            "irrelevant_reason": ts.get("irrelevant_reason", ""),
+            "context_grouping": ts.get("context_grouping", ""),
+            "row_count": len(t["rows"]),
+            "column_mapping": ts.get("column_mapping", {})})
+        if ts.get("classification") == "uncertain":
+            triage_warnings.append({"code": "uncertain-table",
+                                    "detail": f"table={t['table_index']}"})
+        elif ts.get("classification") in ("mapping-failed",
+                                          "mapping-pass-not-run"):
+            triage_warnings.append({"code": "mapping-failed",
+                                    "detail": f"table={t['table_index']}"})
 
     # ---- top-level warnings ----------------------------------------------
     extract_warnings = json.loads(
@@ -1208,7 +1266,8 @@ def cmd_finalize(args):
         [{"code": "rule-conflict", "rule_ids": c["rule_ids"],
          "scope_level": c["scope_level"]} for c in manifest.get("rule_conflicts", [])] + \
         [{"code": "duplicate-finding-dropped", "detail": fid} for fid in dropped] + \
-        [{"code": c["code"], "finding_ids": c["finding_ids"]} for c in contradictions]
+        [{"code": c["code"], "finding_ids": c["finding_ids"]} for c in contradictions] + \
+        triage_warnings
 
     final = {
         "manifest": manifest,
@@ -1220,16 +1279,22 @@ def cmd_finalize(args):
         "unaddressed_rules": unaddressed_rules,
         "ambiguous": ambiguous,
         "unresolved_rows": unresolved_rows,
+        "table_triage": table_triage,
     }
     (run_dir / "final.json").write_text(json.dumps(final, indent=1),
                                         encoding="utf-8")
 
-    # ---- persist post-finalize mutations (allow-pending tier/warning changes) --
+    # ---- persist post-finalize mutations (allow-pending tier/warning/table
+    # changes) --
     # (validation_failures.jsonl / findings.jsonl / semantic_requests.jsonl /
     # consumed fingerprints were already persisted above, before the
-    # refusal/coverage gates; re-persist only match_state here to capture
-    # the allow-pending tier="T4" / matching-pass-not-run mutations.)
+    # refusal/coverage gates; re-persist match_state/table_state/
+    # company_records here to capture the allow-pending mutations: T4/
+    # matching-pass-not-run tiers, mapping-pass-not-run classifications, and
+    # canonicalize-pass-not-run failed records.)
     common.write_jsonl(run_dir / "match_state.jsonl", match_state)
+    common.write_jsonl(run_dir / "table_state.jsonl", table_state)
+    common.write_jsonl(run_dir / "company_records.jsonl", company_records)
 
     if not args.no_report:
         import report

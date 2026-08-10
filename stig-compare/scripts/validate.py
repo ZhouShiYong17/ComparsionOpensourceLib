@@ -102,7 +102,7 @@ def validate_semantic_output(output, row, rule):
 def dedup_findings(findings):
     seen, kept, dropped = set(), [], []
     for f in findings:
-        key = (f["row_id"], f["rule_id"], f["finding_type"])
+        key = (f["record_id"], f["rule_id"], f["finding_type"])
         if key in seen:
             dropped.append(f["finding_id"])
         else:
@@ -114,7 +114,7 @@ def dedup_findings(findings):
 def find_contradictions(findings):
     by_pair = {}
     for f in findings:
-        by_pair.setdefault((f["row_id"], f["rule_id"]), []).append(f)
+        by_pair.setdefault((f["record_id"], f["rule_id"]), []).append(f)
     out = []
     for pair, fs in by_pair.items():
         verdicts = {f.get("verdict") for f in fs}

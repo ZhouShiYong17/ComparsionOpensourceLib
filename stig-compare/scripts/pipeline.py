@@ -47,6 +47,8 @@ _STRUCT_FIELDS = ["stig_description", "stig_objective_or_requirement",
 
 _MATCHED_TIERS = ("T0", "T1", "T2")
 
+_SKEPTIC_OUTCOMES = {"upheld", "refuted", "undetermined"}
+
 _NO_RULE = object()  # sentinel: "this failure record has no rule_id field"
 
 
@@ -211,6 +213,75 @@ def _build_finding(row_id, rule_id, verdict, basis, deterministic, finding_type,
     }
 
 
+def _run_deterministic_verdicts(registry, doc_type, match_state, rows_by_id,
+                                 rules_by_id):
+    """Compute deterministic verdicts / semantic hand-off for every matched
+    row (tier in T0/T1/T2) that hasn't had this done yet (m["verdict_done"]
+    is falsy). Mutates each match_state record in place (sets verdict_done,
+    may append a warning) and is therefore idempotent: calling it again once
+    every matched row has been processed is a no-op.
+
+    Shared by cmd_resolve (immediately after a fresh matching pass) and
+    cmd_finalize (closes the gap where a row was matched -- e.g. a T0/T1
+    raw-text match already assigned during `start` -- but `resolve` was
+    never called before `finalize`; previously that left matched-row counts
+    in coverage with no corresponding finding and no warning).
+
+    Returns (new_findings, new_semantic_requests).
+    """
+    new_findings = []
+    new_semantic_requests = []
+    for m in match_state:
+        if m["tier"] not in _MATCHED_TIERS or not m.get("matched_rule_id"):
+            continue
+        if m.get("verdict_done"):
+            continue
+        row_id = m["row_id"]
+        row = rows_by_id.get(row_id)
+        rule_id = m["matched_rule_id"]
+        rule = rules_by_id.get(rule_id)
+        if row is None or rule is None:
+            # Matched to a rule_id that doesn't resolve to a real official rule
+            # (state corruption / shortlist-registry mismatch): never leave
+            # this silently unprocessed forever -- flag it and stop retrying.
+            m["verdict_done"] = True
+            m["warnings"].append("unknown-matched-rule")
+            continue
+        context = _context_for_row(row, doc_type, field="expected_value")
+        applied, _ = rules_mod.applicable_rules(registry, context)
+        observed_raw = row.get("observed_value_or_evidence", "")
+        expected_raw = rule.get("expected_value", "")
+        eq_rule_id = None
+        if common.fold_ws(observed_raw):
+            # The equivalence shortcut must never override the missing-
+            # evidence hard rule: only consult it when there is evidence.
+            eq_rule_id = rules_mod.equivalent_by_rule(applied, observed_raw,
+                                                       expected_raw)
+        applied_rules_list = []
+        if eq_rule_id:
+            result = {"verdict": "Compliant", "basis": "rule-equivalence",
+                      "deterministic": True, "approved_alignment": None,
+                      "observation": {"observed": observed_raw,
+                                      "expected": expected_raw}}
+            applied_rules_list = [eq_rule_id]
+        else:
+            result = compare_values.deterministic_verdict(row, rule)
+
+        m["verdict_done"] = True
+        if result is not None:
+            finding = _build_finding(
+                row_id, rule_id, result["verdict"], result["basis"],
+                result["deterministic"], None, result["observation"], None,
+                applied_rules_list, m, row, rule,
+                approved_alignment=result.get("approved_alignment"))
+            new_findings.append(finding)
+        else:
+            new_semantic_requests.append(
+                {"row_id": row_id, "rule_id": rule_id, "row": row, "rule": rule,
+                 "instructions_file": "prompts/semantic_compare.md"})
+    return new_findings, new_semantic_requests
+
+
 def assign_confidence(match_record, finding, skeptic_outcome):
     tier = match_record.get("tier")
     deterministic = bool(finding.get("deterministic"))
@@ -232,8 +303,12 @@ def assign_confidence(match_record, finding, skeptic_outcome):
 def cmd_start(args):
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
-    official = extract.extract_official(args.official)
-    company = extract.extract_company(args.company)
+    try:
+        official = extract.extract_official(args.official)
+        company = extract.extract_company(args.company)
+    except Exception as e:                        # no document text in errors
+        print(f"pipeline: cannot read file: {type(e).__name__}", file=sys.stderr)
+        return 2
     normalize.add_normalized(official["records"], _OFFICIAL_NORM_FIELDS)
     normalize.add_normalized(company["records"], _COMPANY_NORM_FIELDS)
 
@@ -473,56 +548,8 @@ def cmd_resolve(args):
                 m["rule_quote"] = resp["rule_quote"]
 
     # ---- deterministic verdict / semantic hand-off -------------------------
-    new_findings = []
-    new_semantic_requests = []
-    for m in match_state:
-        if m["tier"] not in _MATCHED_TIERS or not m.get("matched_rule_id"):
-            continue
-        if m.get("verdict_done"):
-            continue
-        row_id = m["row_id"]
-        row = rows_by_id.get(row_id)
-        rule_id = m["matched_rule_id"]
-        rule = rules_by_id.get(rule_id)
-        if row is None or rule is None:
-            # Matched to a rule_id that doesn't resolve to a real official rule
-            # (state corruption / shortlist-registry mismatch): never leave
-            # this silently unprocessed forever -- flag it and stop retrying.
-            m["verdict_done"] = True
-            m["warnings"].append("unknown-matched-rule")
-            continue
-        context = _context_for_row(row, doc_type, field="expected_value")
-        applied, _ = rules_mod.applicable_rules(registry, context)
-        observed_raw = row.get("observed_value_or_evidence", "")
-        expected_raw = rule.get("expected_value", "")
-        eq_rule_id = None
-        if common.fold_ws(observed_raw):
-            # The equivalence shortcut must never override the missing-
-            # evidence hard rule: only consult it when there is evidence.
-            eq_rule_id = rules_mod.equivalent_by_rule(applied, observed_raw,
-                                                       expected_raw)
-        applied_rules_list = []
-        if eq_rule_id:
-            result = {"verdict": "Compliant", "basis": "rule-equivalence",
-                      "deterministic": True, "approved_alignment": None,
-                      "observation": {"observed": observed_raw,
-                                      "expected": expected_raw}}
-            applied_rules_list = [eq_rule_id]
-        else:
-            result = compare_values.deterministic_verdict(row, rule)
-
-        m["verdict_done"] = True
-        if result is not None:
-            finding = _build_finding(
-                row_id, rule_id, result["verdict"], result["basis"],
-                result["deterministic"], None, result["observation"], None,
-                applied_rules_list, m, row, rule,
-                approved_alignment=result.get("approved_alignment"))
-            new_findings.append(finding)
-        else:
-            new_semantic_requests.append(
-                {"row_id": row_id, "rule_id": rule_id, "row": row, "rule": rule,
-                 "instructions_file": "prompts/semantic_compare.md"})
+    new_findings, new_semantic_requests = _run_deterministic_verdicts(
+        registry, doc_type, match_state, rows_by_id, rules_by_id)
 
     # ---- persist -------------------------------------------------------
     common.write_jsonl(run_dir / "match_state.jsonl", match_state)
@@ -577,6 +604,17 @@ def cmd_finalize(args):
         _ensure_match_fields(m)
     state_by_id = {m["row_id"]: m for m in match_state}
 
+    # ---- deterministic verdict / semantic hand-off -------------------------
+    # Closes the gap where a row was matched (e.g. a T0/T1 raw-text match
+    # already assigned during `start`) but `resolve` was never called before
+    # `finalize`: without this, a matched row could reach final.json with no
+    # corresponding finding and no warning. Idempotent (guarded by each
+    # match_state record's verdict_done) so calling this on every `finalize`
+    # -- even after `resolve` already ran it -- is a safe no-op for rows
+    # already processed.
+    verdict_findings_new, verdict_semantic_requests_new = _run_deterministic_verdicts(
+        registry, doc_type, match_state, rows_by_id, rules_by_id)
+
     consumed = _load_consumed(run_dir)
     consumed_semantic = set(consumed["semantic"])
 
@@ -591,7 +629,8 @@ def cmd_finalize(args):
         if state_by_id.get(rid, {}).get("tier") is None)
 
     # ---- semantic responses -------------------------------------------
-    semantic_requests_all = _read_jsonl_opt(run_dir / "semantic_requests.jsonl")
+    semantic_requests_all = (_read_jsonl_opt(run_dir / "semantic_requests.jsonl")
+                             + verdict_semantic_requests_new)
     semantic_pairs = {(r["row_id"], r["rule_id"]) for r in semantic_requests_all}
     resolved_pairs = set()
     semantic_findings = []
@@ -668,9 +707,17 @@ def cmd_finalize(args):
     # fingerprints) *before* any early return below. A refusal or coverage-
     # abort must not silently discard work already done, or the two-strike
     # retry counter would never advance across repeated `finalize` calls.
+    # This also persists this call's deterministic-verdict pass (new
+    # findings + any semantic hand-off it produced, plus the verdict_done /
+    # warnings mutations already carried on state_by_id's match_state
+    # records) for the same reason -- a refusal must not throw that work
+    # away, or it would be silently recomputed (or silently lost, if
+    # verdict_done already flipped True) on the next call.
     common.write_jsonl(run_dir / "match_state.jsonl", list(state_by_id.values()))
     _append_jsonl(run_dir / "validation_failures.jsonl", new_validation_failures)
-    _append_jsonl(run_dir / "semantic_requests.jsonl", new_semantic_requests)
+    _append_jsonl(run_dir / "findings.jsonl", verdict_findings_new)
+    _append_jsonl(run_dir / "semantic_requests.jsonl",
+                 new_semantic_requests + verdict_semantic_requests_new)
     consumed["semantic"] = sorted(consumed_semantic)
     _save_consumed(run_dir, consumed)
 
@@ -713,32 +760,39 @@ def cmd_finalize(args):
     # Tolerant read for crash-safety. Valid lines are naturally idempotent
     # (re-merging the same outcome onto the same finding_id is a no-op) and
     # MUST be reprocessed every call -- there is no other persisted "already
-    # applied" state for them, unlike match_state's tier. Only malformed
-    # lines are fingerprinted, so a persistently-broken line doesn't add a
-    # duplicate validation_failures entry on every finalize call.
+    # applied" state for them, unlike match_state's tier. Only invalid/
+    # unusable lines (malformed JSON, bad outcome/reason type, or a
+    # finding_id that doesn't match anything in this run) are fingerprinted,
+    # so a persistently-broken or persistently-unresolvable line doesn't add
+    # a duplicate validation_failures entry on every finalize call.
+    known_finding_ids = {f["finding_id"] for f in all_findings}
     consumed_skeptic = set(consumed["skeptic"])
     skeptic_by_finding = {}
     skeptic_malformed = []
+
+    def _record_skeptic_failure(code, resp_or_raw, raw_line):
+        fp = _fingerprint(raw_line)
+        if fp in consumed_skeptic:
+            return                  # already-recorded invalid line -> no-op
+        consumed_skeptic.add(fp)
+        skeptic_malformed.append(_mk_failure(None, "skeptic", [code], resp_or_raw))
+
     for raw_line in _read_response_lines(run_dir / "skeptic_responses.jsonl"):
         resp, parse_err = _parse_response_line(raw_line)
         if parse_err:
-            fp = _fingerprint(raw_line)
-            if fp in consumed_skeptic:
-                continue               # already-recorded malformed line -> no-op
-            consumed_skeptic.add(fp)
-            skeptic_malformed.append(
-                _mk_failure(None, "skeptic", [parse_err], raw_line))
+            _record_skeptic_failure(parse_err, raw_line, raw_line)
             continue
         fid = resp.get("finding_id") if isinstance(resp.get("finding_id"), str) \
             else None
         outcome = resp.get("outcome")
-        if fid is None or not isinstance(outcome, str):
-            fp = _fingerprint(raw_line)
-            if fp in consumed_skeptic:
-                continue               # already-recorded malformed line -> no-op
-            consumed_skeptic.add(fp)
-            skeptic_malformed.append(
-                _mk_failure(None, "skeptic", ["malformed-response"], resp))
+        reason = resp.get("reason")
+        if (fid is None or not isinstance(outcome, str)
+                or outcome not in _SKEPTIC_OUTCOMES
+                or (reason is not None and not isinstance(reason, str))):
+            _record_skeptic_failure("malformed-response", resp, raw_line)
+            continue
+        if fid not in known_finding_ids:
+            _record_skeptic_failure("no-such-request", resp, raw_line)
             continue
         skeptic_by_finding[fid] = resp
     if skeptic_malformed:
@@ -898,10 +952,10 @@ def cmd_finalize(args):
                                         encoding="utf-8")
 
     # ---- persist post-finalize mutations (allow-pending tier/warning changes) --
-    # (validation_failures.jsonl / semantic_requests.jsonl / consumed
-    # fingerprints were already persisted above, before the refusal/coverage
-    # gates; re-persist only match_state here to capture the allow-pending
-    # tier="T4" / matching-pass-not-run mutations.)
+    # (validation_failures.jsonl / findings.jsonl / semantic_requests.jsonl /
+    # consumed fingerprints were already persisted above, before the
+    # refusal/coverage gates; re-persist only match_state here to capture
+    # the allow-pending tier="T4" / matching-pass-not-run mutations.)
     common.write_jsonl(run_dir / "match_state.jsonl", match_state)
 
     if not args.no_report:

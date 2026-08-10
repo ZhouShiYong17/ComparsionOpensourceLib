@@ -228,6 +228,46 @@ def test_skeptic_refuted_marks_disputed_but_keeps_finding(run):
     assert det2["verdict"] == "Compliant"           # kept, not overwritten
 
 
+def test_skeptic_merge_rejects_bad_outcome_bad_reason_and_unknown_finding(run):
+    """Minor finding 5: the skeptic merge must not merge an out-of-enum
+    outcome, a non-string reason, or an unknown finding_id -- each must be
+    recorded as a validation failure (malformed-response / no-such-request)
+    instead of being merged onto a finding or silently dropped."""
+    common.write_jsonl(run / "matching_responses.jsonl", [])
+    rc = pipeline.main(["resolve", "--run-dir", str(run)])
+    assert rc == 0
+    rc = pipeline.main(["finalize", "--run-dir", str(run), "--no-report",
+                        "--allow-pending"])
+    assert rc == 0
+    final = json.loads((run / "final.json").read_text(encoding="utf-8"))
+    det = [f for f in final["findings"] if f["row_id"] == "R-c390d3d4"][0]
+    assert det["skeptic"] is None
+
+    bad_outcome = {"finding_id": det["finding_id"], "outcome": "maybe",
+                  "reason": "not a real outcome value"}
+    bad_reason_type = {"finding_id": det["finding_id"], "outcome": "upheld",
+                       "reason": ["not", "a", "string"]}
+    unknown_fid = {"finding_id": "F-doesnotexist00", "outcome": "upheld",
+                  "reason": "fine but nothing to attach to"}
+    common.write_jsonl(run / "skeptic_responses.jsonl",
+                       [bad_outcome, bad_reason_type, unknown_fid])
+    rc = pipeline.main(["finalize", "--run-dir", str(run), "--no-report",
+                        "--allow-pending"])
+    assert rc == 0
+    final2 = json.loads((run / "final.json").read_text(encoding="utf-8"))
+    det2 = [f for f in final2["findings"]
+            if f["finding_id"] == det["finding_id"]][0]
+    assert det2["skeptic"] is None                 # none of the three merged
+    assert det2["disputed"] is False
+
+    failures = common.read_jsonl(run / "validation_failures.jsonl")
+    skeptic_failures = [f for f in failures if f["kind"] == "skeptic"]
+    malformed = [f for f in skeptic_failures if "malformed-response" in f["errors"]]
+    no_such = [f for f in skeptic_failures if "no-such-request" in f["errors"]]
+    assert len(malformed) == 2       # bad_outcome + bad_reason_type
+    assert len(no_such) == 1         # unknown_fid
+
+
 def test_replayed_matching_response_is_a_no_op(run):
     """(e) Re-running resolve with an unchanged matching_responses.jsonl must
     not re-apply, re-fail, or otherwise disturb an already-consumed
@@ -365,3 +405,139 @@ def test_needs_structuring_row_matched_by_raw_text_counts_as_matched(tmp_path):
     assert "V-1001" not in unaddressed_ids
     assert not any(r["row_id"] == row_id for r in final["unresolved_rows"])
     assert any(f["row_id"] == row_id for f in final["findings"])
+
+
+def test_finalize_without_resolve_still_computes_deterministic_verdicts(run):
+    """Important finding 1: `finalize` must never silently skip the
+    deterministic-verdict pass for a matched row just because `resolve` was
+    never called. Row 1 of company_docx is a T1 raw-text match to V-1001
+    (assigned during `start`, before any Claude round-trip) -- calling
+    `finalize --allow-pending` directly, with no `resolve` in between, must
+    still produce V-1001's deterministic Compliant finding instead of
+    silently leaving matched=1 with zero findings."""
+    state = {m["row_id"]: m for m in common.read_jsonl(run / "match_state.jsonl")}
+    t1_rows = [rid for rid, m in state.items() if m["tier"] == "T1"
+              and m.get("matched_rule_id") == "V-1001"]
+    assert t1_rows                              # sanity: fixture still T1s row 1
+    row_id = t1_rows[0]
+    assert not state[row_id].get("verdict_done")    # never resolved
+
+    rc = pipeline.main(["finalize", "--run-dir", str(run), "--no-report",
+                        "--allow-pending"])
+    assert rc == 0
+    final = json.loads((run / "final.json").read_text(encoding="utf-8"))
+    assert final["coverage"]["company"]["matched"] >= 1
+
+    matches = [f for f in final["findings"]
+              if f["row_id"] == row_id and f["rule_id"] == "V-1001"]
+    assert matches, "finalize without resolve must still emit V-1001's finding"
+    f = matches[0]
+    assert f["verdict"] == "Compliant"
+    assert f["deterministic"] is True
+    assert f["basis"] == "value-comparison"
+
+    state2 = {m["row_id"]: m for m in common.read_jsonl(run / "match_state.jsonl")}
+    assert state2[row_id]["verdict_done"] is True
+
+
+# --------------------------------------------------------------------------
+# Important finding 4: the structuring response path had zero committed
+# tests. Cover both the verbatim-accepted and the paraphrase-rejected path.
+# --------------------------------------------------------------------------
+
+def test_structuring_response_verbatim_accepted_and_paraphrase_rejected(tmp_path):
+    fx = build_all(tmp_path / "fx")
+    run_dir = tmp_path / "run"
+    rc = pipeline.main(["start", "--official", str(fx["official_csv"]),
+                        "--company", str(fx["company_docx_messy"]),
+                        "--run-dir", str(run_dir)])
+    assert rc == 0
+    struct_reqs = common.read_jsonl(run_dir / "structuring_requests.jsonl")
+    assert len(struct_reqs) >= 2          # messy headers force structuring
+
+    # row_a: the password-reuse row -- its raw text literally contains
+    # "Run SHOW PARAMETER password_reuse_max", a verbatim substring.
+    row_a = struct_reqs[0]
+    verbatim_snippet = "Run SHOW PARAMETER password_reuse_max"
+    assert verbatim_snippet in row_a["original_company_text"]
+    resp_a = {"row_id": row_a["row_id"],
+             "stig_command_or_value": verbatim_snippet}
+
+    # row_b: answered with a paraphrase that is NOT a verbatim substring of
+    # its original_company_text.
+    row_b = struct_reqs[1]
+    paraphrase = "This describes a sixty day password rotation policy, " \
+                 "paraphrased and not quoted from the source text at all."
+    assert paraphrase not in row_b["original_company_text"]
+    resp_b = {"row_id": row_b["row_id"],
+             "stig_command_or_value": paraphrase}
+
+    common.write_jsonl(run_dir / "structuring_responses.jsonl", [resp_a, resp_b])
+    rc = pipeline.main(["resolve", "--run-dir", str(run_dir)])
+    assert rc == 0
+
+    rows = {r["row_id"]: r for r in common.read_jsonl(run_dir / "company_rows.jsonl")}
+
+    # (a) verbatim substring -> accepted: status "ok", field set, and the
+    # row must have advanced past needs-structuring into either a fresh
+    # matching request or a deterministic T0/T1 match.
+    row_a_after = rows[row_a["row_id"]]
+    assert row_a_after["status"] == "ok"
+    assert row_a_after["stig_command_or_value"] == verbatim_snippet
+
+    match_state = {m["row_id"]: m for m in common.read_jsonl(
+        run_dir / "match_state.jsonl")}
+    m_a = match_state[row_a["row_id"]]
+    new_matching_requests = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    if m_a["tier"] in ("T0", "T1"):
+        assert m_a["matched_rule_id"] is not None
+    else:
+        assert any(r["row_id"] == row_a["row_id"] for r in new_matching_requests), \
+            "structured row must get a new matching request or a T0/T1 tier"
+
+    # (b) paraphrase -> rejected: extraction-failed, notes explain why, and
+    # a validation_failures.jsonl entry records a not-verbatim: code.
+    row_b_after = rows[row_b["row_id"]]
+    assert row_b_after["status"] == "extraction-failed"
+    assert "structuring-rejected" in row_b_after["notes"]
+
+    failures = common.read_jsonl(run_dir / "validation_failures.jsonl")
+    b_failures = [f for f in failures if f["row_id"] == row_b["row_id"]]
+    assert b_failures
+    assert any(any(e.startswith("not-verbatim:") for e in f["errors"])
+              for f in b_failures)
+
+
+# --------------------------------------------------------------------------
+# Minor finding 6: cmd_start must wrap its extract calls the same way
+# extract.py's own CLI handler does -- a typed, content-free stderr message
+# and exit code 2, never a raw traceback.
+# --------------------------------------------------------------------------
+
+def test_start_wraps_unreadable_official_file_as_typed_error(tmp_path, capsys):
+    fx = build_all(tmp_path / "fx")
+    run_dir = tmp_path / "run"
+    missing_official = tmp_path / "does-not-exist.csv"
+    rc = pipeline.main(["start", "--official", str(missing_official),
+                        "--company", str(fx["company_docx"]),
+                        "--run-dir", str(run_dir)])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "pipeline: cannot read file: FileNotFoundError" in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+
+
+def test_start_wraps_unreadable_company_file_as_typed_error(tmp_path, capsys):
+    fx = build_all(tmp_path / "fx")
+    run_dir = tmp_path / "run"
+    bad_company = tmp_path / "unsupported.txt"
+    bad_company.write_text("not a real submission", encoding="utf-8")
+    rc = pipeline.main(["start", "--official", str(fx["official_csv"]),
+                        "--company", str(bad_company),
+                        "--run-dir", str(run_dir)])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "pipeline: cannot read file: ValueError" in captured.err
+    assert "not a real submission" not in captured.err
+    assert "Traceback" not in captured.err

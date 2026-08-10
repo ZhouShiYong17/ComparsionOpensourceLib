@@ -73,12 +73,11 @@ surfaced rather than worked around.
    ```
    A non-zero exit code here means extraction failed (bad file, unreadable
    format, etc.) — surface the error and stop; do not try to patch around
-   it. On a genuinely corrupted input file, `start` can also crash with a
-   raw Python traceback instead of a clean exit code (this is a known gap,
-   not something to work around here) — if that happens, report the
-   exception type shown at the bottom of the traceback and stop; do not
-   retry the same file, do not attempt to re-parse or repair it yourself,
-   and do not fabricate extraction results to keep going.
+   it. On an unreadable or corrupted input file, `start` exits with code
+   `2` and prints `pipeline: cannot read file: <ExceptionTypeName>` to
+   stderr (never document content) — report that exception type and stop;
+   do not retry the same file, do not attempt to re-parse or repair it
+   yourself, and do not fabricate extraction results to keep going.
 
 4. **Answer structuring and matching requests, then resolve — repeat while
    there is new work, capped at 2 rounds.** After `start` (and after every

@@ -39,7 +39,15 @@ def technical_tokens(text):
         if len(tok) >= 4 and ("_" in tok or "." in tok or "\\" in tok or "/" in tok):
             out.add(tok)
     for m in re.finditer(r"\b[A-Z][A-Z0-9_]{3,}\b", text or ""):
-        out.add(m.group(0).lower())
+        tok = m.group(0).lower()
+        # A shouted generic word (e.g. "SHOW", "NOTE") is not a technical
+        # signature just because it happens to be in all caps: exclude
+        # stopwords and require some real length before trusting a bare
+        # ALL-CAPS token as a unique-match signal (snake_case/dotted/path
+        # tokens above are unaffected -- they still require an underscore,
+        # dot, or path separator).
+        if len(tok) >= 5 and tok not in _STOPWORDS:
+            out.add(tok)
     return out
 
 

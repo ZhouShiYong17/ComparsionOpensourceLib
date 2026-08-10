@@ -21,6 +21,38 @@ def test_technical_tokens():
     assert "run" not in t and "and" not in t
 
 
+def test_all_caps_stopword_not_a_technical_token():
+    # Review finding: a shouted generic word ("SHOW") must never itself be
+    # treated as a technical signature -- it's excluded (stopword) from the
+    # ALL-CAPS branch entirely, unlike a real technical signature such as
+    # "PASSWORD_LIFE_TIME" (has an underscore, survives regardless of case).
+    t = candidates.technical_tokens("Please SHOW the current NOTE banner")
+    assert "show" not in t
+
+
+def test_all_caps_stopword_gives_no_t1_match_or_technical_score():
+    # A row and a rule that share ONLY a shouted generic word ("SHOW") in
+    # all caps must not produce a silent, unreviewed T1 match, and the
+    # "technical" feature must score 0 for that pair.
+    official = [{"rule_id": "V-9001", "title": "Banner display",
+                "severity": "low",
+                "check_text": "Run SHOW to inspect the banner setting.",
+                "fix_text": "No fix needed.", "expected_value": ""}]
+    row = {"row_id": "R-shoutcap1", "status": "ok", "context_grouping": "",
+          "stig_description": "", "stig_objective_or_requirement": "",
+          "stig_command_or_value": "",
+          "company_approved_setting_or_expected_value": "",
+          "observed_value_or_evidence": "",
+          "original_company_text": "Admin must SHOW the current banner text"}
+    results = candidates.generate([row], official)
+    assert results[0]["tier"] is None
+    assert results[0]["matched_rule_id"] is None
+
+    idf = candidates.build_idf(official)
+    scored = candidates.score_row(row, official[0], idf)
+    assert scored["features"]["technical"] == 0.0
+
+
 def test_t1_unique_technical_signature(data):
     official, company = data
     results = candidates.generate(company, official)

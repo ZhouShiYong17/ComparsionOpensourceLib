@@ -35,3 +35,11 @@ def test_empty_official_warns(tmp_path):
     result = extract.extract_official(p)
     assert result["records"] == []
     assert any(w["code"] == "empty-official-file" for w in result["warnings"])
+
+
+def test_csv_with_blank_rows_warns(tmp_path):
+    p = tmp_path / "blank_rows.csv"
+    p.write_text("Rule ID,Title\n\n  \n", encoding="utf-8")
+    result = extract.extract_official(p)
+    assert result["records"] == []
+    assert any(w["code"] == "empty-official-file" for w in result["warnings"])

@@ -81,6 +81,8 @@ def extract_official(path):
     suffix = path.suffix.lower()
     if suffix == ".csv":
         records, warnings = _official_from_table(_rows_from_csv(path), path, "csv")
+        if not records and not warnings:
+            warnings.append({"code": "empty-official-file", "detail": "csv: no data rows"})
     elif suffix == ".json":
         data = json.loads(path.read_text(encoding="utf-8"))
         records, warnings = [], []

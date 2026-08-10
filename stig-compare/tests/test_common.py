@@ -49,3 +49,16 @@ def test_load_versions_includes_prompt_hashes(tmp_path):
     assert v["skill_version"] == "0.1.0"
     assert "matching.md" in v["prompt_hashes"]
     assert len(v["prompt_hashes"]["matching.md"]) == 64
+
+
+def test_record_id_stable_and_prefixed():
+    a = common.record_id(1, 2, 0, "some | row | text")
+    b = common.record_id(1, 2, 0, "some | row | text")
+    assert a == b
+    assert a.startswith("CR-") and len(a) == 3 + 8
+
+
+def test_record_id_varies_by_sub_index():
+    a = common.record_id(1, 2, 0, "text")
+    b = common.record_id(1, 2, 1, "text")
+    assert a != b

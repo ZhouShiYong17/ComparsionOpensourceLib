@@ -17,6 +17,10 @@ def row_id(table_index, row_index, raw_text):
     return "R-" + short_hash(table_index, row_index, raw_text)
 
 
+def record_id(table_index, row_index, sub_index, raw_text):
+    return "CR-" + short_hash(table_index, row_index, sub_index, raw_text)
+
+
 def finding_id(rid, rule_id, finding_type):
     return "F-" + short_hash(rid, rule_id, finding_type)
 

@@ -138,7 +138,7 @@ def _load_consumed(run_dir):
         data = json.loads(p.read_text(encoding="utf-8"))
     else:
         data = {}
-    for k in ("structuring", "matching", "semantic"):
+    for k in ("structuring", "matching", "semantic", "skeptic"):
         data.setdefault(k, [])
     return data
 
@@ -710,14 +710,22 @@ def cmd_finalize(args):
     all_findings = det_findings + semantic_findings + passnotrun_findings
 
     # ---- skeptic merge -------------------------------------------------
-    # Tolerant read for crash-safety; naturally idempotent (re-merging the
-    # same outcome onto the same finding_id is a no-op), so no fingerprinting
-    # is needed here -- only parse/type safety.
+    # Tolerant read for crash-safety. Valid lines are naturally idempotent
+    # (re-merging the same outcome onto the same finding_id is a no-op) and
+    # MUST be reprocessed every call -- there is no other persisted "already
+    # applied" state for them, unlike match_state's tier. Only malformed
+    # lines are fingerprinted, so a persistently-broken line doesn't add a
+    # duplicate validation_failures entry on every finalize call.
+    consumed_skeptic = set(consumed["skeptic"])
     skeptic_by_finding = {}
     skeptic_malformed = []
     for raw_line in _read_response_lines(run_dir / "skeptic_responses.jsonl"):
         resp, parse_err = _parse_response_line(raw_line)
         if parse_err:
+            fp = _fingerprint(raw_line)
+            if fp in consumed_skeptic:
+                continue               # already-recorded malformed line -> no-op
+            consumed_skeptic.add(fp)
             skeptic_malformed.append(
                 _mk_failure(None, "skeptic", [parse_err], raw_line))
             continue
@@ -725,12 +733,18 @@ def cmd_finalize(args):
             else None
         outcome = resp.get("outcome")
         if fid is None or not isinstance(outcome, str):
+            fp = _fingerprint(raw_line)
+            if fp in consumed_skeptic:
+                continue               # already-recorded malformed line -> no-op
+            consumed_skeptic.add(fp)
             skeptic_malformed.append(
                 _mk_failure(None, "skeptic", ["malformed-response"], resp))
             continue
         skeptic_by_finding[fid] = resp
     if skeptic_malformed:
         _append_jsonl(run_dir / "validation_failures.jsonl", skeptic_malformed)
+    consumed["skeptic"] = sorted(consumed_skeptic)
+    _save_consumed(run_dir, consumed)
 
     for f in all_findings:
         s = skeptic_by_finding.get(f["finding_id"])
@@ -743,15 +757,23 @@ def cmd_finalize(args):
     contradictions = validate.find_contradictions(kept)
 
     # ---- coverage --------------------------------------------------------
-    # Rows still stuck in needs-structuring (never answered, or rejected with
-    # no further retry) must land in coverage's needs_structuring_unresolved
-    # bucket. candidates.generate() emits a match_state record for them too
-    # (so T0/T1 raw-text detection still runs pre-structuring), which would
-    # otherwise make that bucket unreachable -- exclude them from what
-    # coverage sees so `rid not in by_row` is true for every such row.
+    # Rows still stuck in needs-structuring *and never matched* (never
+    # answered, or rejected with no further retry, tier still None) must
+    # land in coverage's needs_structuring_unresolved bucket -- exclude only
+    # those from what coverage sees so `rid not in by_row` is true for them.
+    # candidates.generate() also runs T0/T1 raw-text detection on
+    # needs-structuring rows (so e.g. a row whose raw text quotes a rule id
+    # gets matched before structuring even runs); such a row already has a
+    # matched_rule_id, a real finding, and must be counted as matched here
+    # too -- excluding it unconditionally by status alone would inflate
+    # needs_structuring_unresolved and make coverage.official disagree with
+    # unaddressed_rules (which is computed from the unfiltered match_state).
+    def _needs_structuring_and_unmatched(m):
+        row = rows_by_id.get(m["row_id"], {})
+        return row.get("status") == "needs-structuring" and m["tier"] is None
+
     match_state_for_coverage = [
-        m for m in match_state
-        if rows_by_id.get(m["row_id"], {}).get("status") != "needs-structuring"]
+        m for m in match_state if not _needs_structuring_and_unmatched(m)]
     ignored_row_ids = _ignored_row_ids(registry, company_rows, doc_type)
     coverage = coverage_mod.compute(company_rows, official_rules,
                                     match_state_for_coverage, ignored_row_ids)
@@ -834,16 +856,22 @@ def cmd_finalize(args):
         for r in official_rules if r["rule_id"] not in matched_rule_ids]
 
     # Rows that never reached a comparable state at all (still stuck in
-    # needs-structuring, or knocked out to extraction-failed) -- these are
-    # invisible to `unmatched_rows` (which only covers status=="ok" rows) and
-    # to `findings`, so surface them explicitly for the report/audit trail.
+    # needs-structuring with no match, or knocked out to extraction-failed)
+    # -- these are invisible to `unmatched_rows` (which only covers
+    # status=="ok" rows) and to `findings`, so surface them explicitly for
+    # the report/audit trail. A needs-structuring row that raw-text-matched
+    # to T0/T1 (see the coverage note above) already has a finding and is
+    # counted as matched -- it belongs in neither bucket, so it uses the
+    # same "unmatched" condition as match_state_for_coverage.
     unresolved_rows = [
         {"row_id": r["row_id"], "status": r.get("status"),
          "notes": r.get("notes", ""),
          "source_reference": r.get("source_reference", {}),
          "original_company_text": r.get("original_company_text", "")}
         for r in company_rows
-        if r.get("status") in ("needs-structuring", "extraction-failed")]
+        if r.get("status") == "extraction-failed"
+        or (r.get("status") == "needs-structuring" and
+            state_by_id.get(r["row_id"], {}).get("tier") is None)]
 
     # ---- top-level warnings ----------------------------------------------
     extract_warnings = json.loads(

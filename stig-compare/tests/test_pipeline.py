@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.build_fixtures import build_all
+from fixtures.build_fixtures import build_all, _write_docx
 import common
 import pipeline
 
@@ -319,3 +319,49 @@ def test_unanswered_structuring_rows_counted_and_listed(tmp_path):
     assert unresolved_ids
     requested_ids = {r["row_id"] for r in struct_reqs}
     assert unresolved_ids <= requested_ids
+
+
+def test_needs_structuring_row_matched_by_raw_text_counts_as_matched(tmp_path):
+    """Re-review regression: a needs-structuring row whose raw text quotes a
+    real rule id (T0) is matched via candidates.generate() before it is ever
+    structured. It must be counted as matched in coverage (not folded into
+    needs_structuring_unresolved), its rule must show as addressed
+    (coverage.official agreeing with unaddressed_rules), it must not appear
+    in unresolved_rows, and its finding must still be present -- previously
+    the coverage-input filter excluded every needs-structuring row by status
+    alone, producing self-contradictory fields in the same final.json."""
+    fx = build_all(tmp_path / "fx")
+    # Messy (unmappable) headers force needs-structuring; the row text
+    # quotes V-1001 verbatim so T0 detection fires despite never being
+    # structured.
+    company_path = tmp_path / "company_v1001.docx"
+    _write_docx(company_path, ["Area", "What we did", "How we checked", "Value"],
+               [["High", "See V-1001 for details", "manual review", ""]])
+
+    run_dir = tmp_path / "run"
+    rc = pipeline.main(["start", "--official", str(fx["official_csv"]),
+                        "--company", str(company_path), "--run-dir", str(run_dir)])
+    assert rc == 0
+    state = common.read_jsonl(run_dir / "match_state.jsonl")
+    assert len(state) == 1 and state[0]["tier"] == "T0"
+    assert state[0]["matched_rule_id"] == "V-1001"
+    row_id = state[0]["row_id"]
+    rows = common.read_jsonl(run_dir / "company_rows.jsonl")
+    assert rows[0]["status"] == "needs-structuring"     # never structured
+
+    rc = pipeline.main(["resolve", "--run-dir", str(run_dir)])
+    assert rc == 0
+    findings = common.read_jsonl(run_dir / "findings.jsonl")
+    assert any(f["row_id"] == row_id and f["rule_id"] == "V-1001"
+              for f in findings)
+
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir), "--no-report"])
+    assert rc == 0
+    final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    assert final["coverage"]["company"]["matched"] == 1
+    assert final["coverage"]["company"]["needs_structuring_unresolved"] == 0
+    assert final["coverage"]["official"]["addressed"] == 1
+    unaddressed_ids = {r["rule_id"] for r in final["unaddressed_rules"]}
+    assert "V-1001" not in unaddressed_ids
+    assert not any(r["row_id"] == row_id for r in final["unresolved_rows"])
+    assert any(f["row_id"] == row_id for f in final["findings"])

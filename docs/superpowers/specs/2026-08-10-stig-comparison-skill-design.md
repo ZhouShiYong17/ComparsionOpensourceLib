@@ -126,8 +126,11 @@ Stages in order. (D) = deterministic Python, (C) = Claude in-session following a
    - **T2 shortlist adjudication:** Claude sees the row and its K candidates (with
      scores) and must answer one of {candidate ID, NONE, AMBIGUOUS} with verbatim
      quotes from both sides. Validator enforces: returned ID ∈ shortlist; quotes exist.
-   - **T3 ambiguous:** two-plus plausible candidates, or top-2 scores within margin and
-     Claude's quotes do not discriminate → reported ambiguous with all candidates shown.
+     A NONE answer sends the row to T4 unmatched, with the shortlist preserved in the
+     run artifact so the report can show what was considered and rejected.
+   - **T3 ambiguous:** two-plus plausible candidates, or top-2 lexical scores within
+     margin (default: within 15% relative) while Claude's quotes do not discriminate
+     between them → reported ambiguous with all candidates shown.
    - **T4 unmatched.**
    Multiple company rows matching the same rule are allowed but flagged as duplicate
    coverage.
@@ -173,7 +176,8 @@ never treated as proof — evidence checks are.
 Confidence is a class with criteria, not a score:
 
 - **High:** T0/T1 match; or T2 with discriminating quotes + deterministic verdict +
-  validator upheld.
+  deterministic validation passed (the skeptical subagent only runs on semantic
+  findings).
 - **Medium:** T2 with verified quotes + semantic verdict upheld by validator.
 - **Low:** narrow candidate margin, weak/non-discriminating quotes, or validator
   undetermined.

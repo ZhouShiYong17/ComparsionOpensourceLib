@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.build_fixtures import build_all
+from fixtures.build_fixtures import build_all, _write_docx, _write_official_csv
 import common
 import pipeline
 
@@ -486,3 +486,460 @@ def test_sweep_originated_findings_capped_medium(tmp_path, fixture_paths):
     for f in swept:
         assert f["confidence"] in ("Medium", "Low")
         assert f["human_review_needed"] is True
+
+
+# --------------------------------------------------------------------------
+# Task 14 review, Finding 1: --allow-pending mutation paths (mapping,
+# canonicalize, matching) had zero test exercise.
+# --------------------------------------------------------------------------
+
+def _answer_extraction_partial(run_dir, skip_tables=()):
+    """Like _answer_extraction, but leaves `skip_tables` table-mapping
+    requests unanswered (so their table_state classification stays None)."""
+    reqs = common.read_jsonl(run_dir / "table_mapping_requests.jsonl")
+    answers = []
+    for r in reqs:
+        if r["table_index"] in skip_tables:
+            continue
+        if r["table_index"] == 1:
+            answers.append(_mapping_answer(r, "irrelevant",
+                                           reason="general-info"))
+        elif r["table_index"] == 2:
+            answers.append(_mapping_answer(r, "irrelevant",
+                                           reason="instructions"))
+        elif r["table_index"] == 3:
+            answers.append(_mapping_answer(r, mapping=EX1_MAPPING))
+        else:
+            answers.append(_mapping_answer(r, mapping=EX2_MAPPING))
+    common.write_jsonl(run_dir / "table_mapping_responses.jsonl", answers)
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    canon_reqs = common.read_jsonl(run_dir / "canonicalize_requests.jsonl")
+    common.write_jsonl(run_dir / "canonicalize_responses.jsonl",
+                       [_canon_answer(r) for r in canon_reqs])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+
+def test_finalize_allow_pending_marks_unmapped_table(tmp_path, fixture_paths):
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    _answer_extraction_partial(run_dir, skip_tables={1})
+
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir), "--no-report"])
+    assert rc == 4
+
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir),
+                        "--no-report", "--allow-pending"])
+    assert rc == 0
+
+    tstate = {t["table_index"]: t
+             for t in common.read_jsonl(run_dir / "table_state.jsonl")}
+    assert tstate[1]["classification"] == "mapping-pass-not-run"
+
+    final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    triage = {t["table_index"]: t for t in final["table_triage"]}
+    assert triage[1]["classification"] == "mapping-pass-not-run"
+    assert final["coverage"]["company"]["extraction_failed"] == 2  # table 1's 2 rows
+    assert any(w.get("code") == "mapping-failed" and w.get("detail") == "table=1"
+               for w in final["warnings"])
+
+
+def _answer_extraction_skip_chunk(run_dir, skip_chunk_table_index):
+    """Like _answer_extraction, but answers every table-mapping request and
+    then leaves `skip_chunk_table_index`'s canonicalize chunk(s) unanswered."""
+    reqs = common.read_jsonl(run_dir / "table_mapping_requests.jsonl")
+    answers = []
+    for r in reqs:
+        if r["table_index"] == 1:
+            answers.append(_mapping_answer(r, "irrelevant",
+                                           reason="general-info"))
+        elif r["table_index"] == 2:
+            answers.append(_mapping_answer(r, "irrelevant",
+                                           reason="instructions"))
+        elif r["table_index"] == 3:
+            answers.append(_mapping_answer(r, mapping=EX1_MAPPING))
+        else:
+            answers.append(_mapping_answer(r, mapping=EX2_MAPPING))
+    common.write_jsonl(run_dir / "table_mapping_responses.jsonl", answers)
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    canon_reqs = common.read_jsonl(run_dir / "canonicalize_requests.jsonl")
+    keep = [r for r in canon_reqs
+           if r["table_index"] != skip_chunk_table_index]
+    common.write_jsonl(run_dir / "canonicalize_responses.jsonl",
+                       [_canon_answer(r) for r in keep])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+
+def test_finalize_allow_pending_marks_unanswered_chunk(tmp_path, fixture_paths):
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    _answer_extraction_skip_chunk(run_dir, skip_chunk_table_index=4)
+
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir), "--no-report"])
+    assert rc == 4
+
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir),
+                        "--no-report", "--allow-pending"])
+    assert rc == 0
+
+    final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    t4_unresolved = [r for r in final["unresolved_rows"]
+                     if r["source_reference"].get("table_index") == 4]
+    assert len(t4_unresolved) == 2                     # EX2 has 2 rows
+    for r in t4_unresolved:
+        assert r["status"] == "extraction-failed"
+        assert "canonicalize-pass-not-run" in r["notes"]
+
+
+def test_finalize_allow_pending_marks_unanswered_matching(tmp_path, fixture_paths):
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    _answer_extraction(run_dir)
+    # matching_requests.jsonl exists but is never answered
+
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir), "--no-report"])
+    assert rc == 4
+
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir),
+                        "--no-report", "--allow-pending"])
+    assert rc == 0
+
+    m_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    requested_ids = {r["record_id"] for r in m_reqs}
+    assert requested_ids
+    match_state = {m["record_id"]: m
+                   for m in common.read_jsonl(run_dir / "match_state.jsonl")}
+    pending = [match_state[rid] for rid in requested_ids]
+    for m in pending:
+        assert m["tier"] == "T4"
+        assert "matching-pass-not-run" in m["warnings"]
+
+    final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    assert final["coverage"]["company"]["unmatched"] >= len(pending)
+
+
+# --------------------------------------------------------------------------
+# Task 14 review, Finding 2: regression coverage rebuilt (against the new
+# record_id/two-phase-extraction flow) for six behaviors that lost coverage
+# when the 15 old-shape tests were deleted.
+# --------------------------------------------------------------------------
+
+def test_second_strike_matching_forces_t4(tmp_path, fixture_paths):
+    """(1) Two genuinely different invalid matching responses for the same
+    record -> tier T4, warning llm-output-rejected, 2 matching validation
+    failures, no finding."""
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    _answer_extraction(run_dir)
+    m_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    assert m_reqs
+    req = m_reqs[0]
+
+    bad1 = {"record_id": req["record_id"], "decision": "match",
+            "selections": [{"rule_id": "V-9999", "row_quote": "x",
+                            "rule_quote": "y"}],
+            "ambiguous_rule_ids": [], "basis": "invented-1"}
+    common.write_jsonl(run_dir / "matching_responses.jsonl", [bad1])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    retry_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    assert any(r.get("retry") and r["record_id"] == req["record_id"]
+              for r in retry_reqs)
+    state = {m["record_id"]: m
+             for m in common.read_jsonl(run_dir / "match_state.jsonl")}
+    assert state[req["record_id"]]["tier"] is None
+    assert state[req["record_id"]]["match_failures"] == 1
+
+    bad2 = {"record_id": req["record_id"], "decision": "match",
+            "selections": [{"rule_id": "V-8888", "row_quote": "x",
+                            "rule_quote": "y"}],
+            "ambiguous_rule_ids": [], "basis": "invented-2"}
+    common.write_jsonl(run_dir / "matching_responses.jsonl", [bad2])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    state2 = {m["record_id"]: m
+             for m in common.read_jsonl(run_dir / "match_state.jsonl")}
+    m = state2[req["record_id"]]
+    assert m["tier"] == "T4"
+    assert "llm-output-rejected" in m["warnings"]
+    findings = common.read_jsonl(run_dir / "findings.jsonl")
+    assert not any(f["record_id"] == req["record_id"] for f in findings)
+
+    failures = common.read_jsonl(run_dir / "validation_failures.jsonl")
+    matching_failures = [f for f in failures if f["kind"] == "matching"
+                         and f["row_id"] == req["record_id"]]
+    assert len(matching_failures) == 2
+
+
+def test_margin_flag_downgrades_to_t3(tmp_path):
+    """(2) Two official rules with byte-identical distinctive text score
+    exactly tied, so candidates.generate() sets margin_flag; when Claude
+    accepts one of them with a rule_quote that is also verbatim in the
+    runner-up's text, resolve downgrades T2 -> T3 instead of trusting the
+    single selection."""
+    shared = {"title": "Widget frobnicator level must be configured",
+             "severity": "medium",
+             "check_text": "Verify the widget_frobnicator_level parameter is set",
+             "fix_text": "Set widget_frobnicator_level to 5",
+             "expected_value": "5"}
+    rules = [dict(shared, rule_id="V-9001"), dict(shared, rule_id="V-9002")]
+    official_path = tmp_path / "official_margin.csv"
+    _write_official_csv(official_path, rules)
+
+    headers = ["STIG REQUIREMENT", "DESCRIPTION", "COMMAND TO VERIFY",
+              "APPROVED SETTING"]
+    rows = [["Widget config", "Widget must be configured per policy",
+            "Verify the widget_frobnicator_level parameter is set", "5"]]
+    company_path = tmp_path / "company_margin.docx"
+    _write_docx(company_path, headers, rows)
+
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start", "--official", str(official_path),
+                          "--company", str(company_path),
+                          "--run-dir", str(run_dir)]) == 0
+
+    mreqs = common.read_jsonl(run_dir / "table_mapping_requests.jsonl")
+    mapping = {"0": "stig_objective_or_requirement", "1": "stig_description",
+              "2": "stig_command_or_value",
+              "3": "company_approved_setting_or_expected_value"}
+    common.write_jsonl(run_dir / "table_mapping_responses.jsonl",
+                       [_mapping_answer(mreqs[0], mapping=mapping)])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    canon_reqs = common.read_jsonl(run_dir / "canonicalize_requests.jsonl")
+    common.write_jsonl(run_dir / "canonicalize_responses.jsonl",
+                       [_canon_answer(r) for r in canon_reqs])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+    match_state = common.read_jsonl(run_dir / "match_state.jsonl")
+    assert len(match_state) == 1
+    m = match_state[0]
+    assert m["tier"] is None
+    assert m["margin_flag"] is True
+    assert {c["rule_id"] for c in m["candidates"]} == {"V-9001", "V-9002"}
+
+    m_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    req = m_reqs[0]
+    chosen_id = m["candidates"][0]["rule_id"]
+    shared_quote = "Verify the widget_frobnicator_level parameter is set"
+    resp = {"record_id": req["record_id"], "decision": "match",
+            "selections": [{
+                "rule_id": chosen_id,
+                "row_quote":
+                    req["record"]["original_company_text"].split(" | ")[0],
+                "rule_quote": shared_quote}],
+            "ambiguous_rule_ids": [], "basis": "shared text"}
+    common.write_jsonl(run_dir / "matching_responses.jsonl", [resp])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+    state2 = {m2["record_id"]: m2
+             for m2 in common.read_jsonl(run_dir / "match_state.jsonl")}
+    m2 = state2[req["record_id"]]
+    assert m2["tier"] == "T3"
+    assert set(m2["ambiguous_rule_ids"]) == {"V-9001", "V-9002"}
+
+
+def test_rule_equivalence_and_missing_evidence_guard(tmp_path, fixture_paths,
+                                                      monkeypatch):
+    """(3) An injected equivalent-terminology rule produces a Compliant /
+    rule-equivalence finding with the rule id recorded in applied_rules when
+    there is evidence -- but every EX1 record (no observed-value column
+    mapped at all) still lands on Cannot Assess / missing-evidence, proving
+    the equivalence shortcut is never consulted when evidence is empty."""
+    fake_registry = {"registry_version": 1, "rules": [
+        {"rule_id": "EQ-1", "category": "equivalent-terminology",
+         "status": "active", "scope": {"level": "global"},
+         "payload": {"a": "10", "b": "14 or more"}}]}
+    monkeypatch.setattr(pipeline.rules_mod, "load_registry",
+                        lambda path: fake_registry)
+
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    _answer_extraction(run_dir)
+
+    m_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    answers = []
+    minlen_record_id = None
+    for req in m_reqs:
+        if "Minimum password length" in req["record"]["original_company_text"]:
+            minlen_record_id = req["record_id"]
+            answers.append(_match_answer(req, ["V-1005"]))
+        else:
+            cand_ids = [c["rule_id"] for c in req["candidates"]]
+            answers.append(_match_answer(req, cand_ids[:1]))
+    assert minlen_record_id is not None
+    common.write_jsonl(run_dir / "matching_responses.jsonl", answers)
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+    findings = common.read_jsonl(run_dir / "findings.jsonl")
+    eq_finding = [f for f in findings if f["record_id"] == minlen_record_id
+                 and f["rule_id"] == "V-1005"][0]
+    assert eq_finding["verdict"] == "Compliant"
+    assert eq_finding["basis"] == "rule-equivalence"
+    assert eq_finding["applied_rules"] == ["EQ-1"]
+
+    ex1_findings = [f for f in findings
+                   if f["company_row"]["source_reference"].get("table_index") == 3]
+    assert ex1_findings
+    for f in ex1_findings:
+        assert f["verdict"] == "Cannot Assess"
+        assert f["basis"] == "missing-evidence"
+        assert f["applied_rules"] == []
+
+
+def test_skeptic_merge_disputes_finding_and_records_bad_responses(tmp_path):
+    """(4) A semantic (non-deterministic) finding refuted by the skeptic is
+    marked disputed with human_review_needed True; a malformed-outcome line
+    and an unknown finding_id in the same skeptic_responses.jsonl batch are
+    each recorded as their own "skeptic" validation failure instead of
+    silently merging or crashing."""
+    official_path = tmp_path / "official_skeptic.csv"
+    _write_official_csv(official_path, [
+        {"rule_id": "V-7001", "title": "Audit logging must be enabled",
+         "severity": "high",
+         "check_text": "Verify audit logging is enabled for all systems",
+         "fix_text": "Enable audit logging", "expected_value": "enabled"}])
+    headers = ["Requirement", "Description", "Command", "Approved Setting",
+              "Observed"]
+    rows = [["Audit logging must be enabled", "Ensure audit trail captured",
+            "Verify audit logging is enabled for all systems", "enabled",
+            "see attached evidence"]]
+    company_path = tmp_path / "company_skeptic.docx"
+    _write_docx(company_path, headers, rows)
+
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start", "--official", str(official_path),
+                          "--company", str(company_path),
+                          "--run-dir", str(run_dir)]) == 0
+
+    mreqs = common.read_jsonl(run_dir / "table_mapping_requests.jsonl")
+    mapping = {"0": "stig_objective_or_requirement", "1": "stig_description",
+              "2": "stig_command_or_value",
+              "3": "company_approved_setting_or_expected_value",
+              "4": "observed_value_or_evidence"}
+    common.write_jsonl(run_dir / "table_mapping_responses.jsonl",
+                       [_mapping_answer(mreqs[0], mapping=mapping)])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    canon_reqs = common.read_jsonl(run_dir / "canonicalize_requests.jsonl")
+    common.write_jsonl(run_dir / "canonicalize_responses.jsonl",
+                       [_canon_answer(r) for r in canon_reqs])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+    m_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    assert len(m_reqs) == 1
+    common.write_jsonl(run_dir / "matching_responses.jsonl",
+                       [_match_answer(m_reqs[0], ["V-7001"])])
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+
+    sem_reqs = common.read_jsonl(run_dir / "semantic_requests.jsonl")
+    assert len(sem_reqs) == 1                  # non-numeric -> semantic path
+    sreq = sem_reqs[0]
+    common.write_jsonl(run_dir / "semantic_responses.jsonl", [{
+        "record_id": sreq["record_id"], "rule_id": sreq["rule_id"],
+        "finding_type": "cannot-determine", "verdict": "Cannot Assess",
+        "row_quote": "see attached evidence",
+        "rule_quote": "Verify audit logging is enabled for all systems",
+        "interpretation": "Evidence reference only; cannot verify without "
+                          "the attachment."}])
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir), "--no-report"])
+    assert rc == 0
+    final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    det = [f for f in final["findings"]
+          if f["record_id"] == sreq["record_id"]][0]
+    fid = det["finding_id"]
+
+    good = {"finding_id": fid, "outcome": "refuted", "reason": "misquoted"}
+    bad_outcome = {"finding_id": fid, "outcome": "maybe", "reason": "n/a"}
+    unknown_fid = {"finding_id": "F-doesnotexist00", "outcome": "upheld",
+                  "reason": "nothing to attach to"}
+    common.write_jsonl(run_dir / "skeptic_responses.jsonl",
+                       [good, bad_outcome, unknown_fid])
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir), "--no-report",
+                        "--allow-pending"])
+    assert rc == 0
+    final2 = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    det2 = [f for f in final2["findings"] if f["finding_id"] == fid][0]
+    assert det2["disputed"] is True
+    assert det2["skeptic"]["outcome"] == "refuted"
+    assert det2["human_review_needed"] is True
+
+    failures = common.read_jsonl(run_dir / "validation_failures.jsonl")
+    skeptic_failures = [f for f in failures if f["kind"] == "skeptic"]
+    assert any("malformed-response" in f["errors"] for f in skeptic_failures)
+    assert any("no-such-request" in f["errors"] for f in skeptic_failures)
+
+
+def _read_jsonl_or_empty(path):
+    return common.read_jsonl(path) if path.exists() else []
+
+
+def test_replay_idempotent_across_resolve_and_finalize(tmp_path, fixture_paths):
+    """(5) Re-running resolve and finalize --allow-pending with every
+    response file unchanged must not duplicate findings, change coverage,
+    or add new validation failures."""
+    run_dir = _full_run(tmp_path, fixture_paths)
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir),
+                        "--no-report", "--allow-pending"])
+    assert rc == 0
+    final1 = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    failures1 = _read_jsonl_or_empty(run_dir / "validation_failures.jsonl")
+
+    assert pipeline.main(["resolve", "--run-dir", str(run_dir)]) == 0
+    rc = pipeline.main(["finalize", "--run-dir", str(run_dir),
+                        "--no-report", "--allow-pending"])
+    assert rc == 0
+    final2 = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+    failures2 = _read_jsonl_or_empty(run_dir / "validation_failures.jsonl")
+
+    ids1 = [f["finding_id"] for f in final1["findings"]]
+    ids2 = [f["finding_id"] for f in final2["findings"]]
+    assert len(ids2) == len(ids1)
+    assert set(ids2) == set(ids1)
+    assert len(ids2) == len(set(ids2))                 # no duplicates
+    assert final2["coverage"] == final1["coverage"]
+    assert len(failures2) == len(failures1)
+
+
+def test_malformed_jsonl_matching_response_tolerated(tmp_path, fixture_paths):
+    """(6) A syntactically-broken line in matching_responses.jsonl is
+    recorded as a validation failure (never a crash) and does not block the
+    rest of the batch from being applied."""
+    run_dir = tmp_path / "run"
+    assert pipeline.main(["start",
+                          "--official", str(fixture_paths["official_csv"]),
+                          "--company",
+                          str(fixture_paths["company_real_docx"]),
+                          "--run-dir", str(run_dir)]) == 0
+    _answer_extraction(run_dir)
+    m_reqs = common.read_jsonl(run_dir / "matching_requests.jsonl")
+    req = m_reqs[0]
+    good = _match_answer(req, [c["rule_id"] for c in req["candidates"]][:1])
+    path = run_dir / "matching_responses.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{this is not valid json,,,\n")
+        f.write(json.dumps(good) + "\n")
+
+    rc = pipeline.main(["resolve", "--run-dir", str(run_dir)])
+    assert rc == 0
+    failures = common.read_jsonl(run_dir / "validation_failures.jsonl")
+    assert any(f["kind"] == "matching" and "malformed-json" in f["errors"]
+              for f in failures)
+    state = {m["record_id"]: m
+            for m in common.read_jsonl(run_dir / "match_state.jsonl")}
+    assert state[req["record_id"]]["tier"] is not None

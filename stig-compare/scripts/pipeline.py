@@ -916,14 +916,29 @@ def cmd_finalize(args):
 
     for raw_line in _read_response_lines(run_dir / "semantic_responses.jsonl"):
         fp = _fingerprint(raw_line)
-        if fp in consumed_semantic:
-            continue                      # already-consumed replay -> no-op
-        consumed_semantic.add(fp)
+        # Unlike matching (where a resolved pair's tier is persisted on
+        # match_state and never re-derived from *_responses.jsonl), a
+        # semantic pair's resolution has no persisted marker other than
+        # "this pair is missing from pending_semantic_pairs" -- which is
+        # itself recomputed from semantic_requests.jsonl (never pruned) on
+        # every call. So an already-consumed *valid* line MUST still be
+        # reprocessed every call (same principle as the skeptic merge below)
+        # to keep rebuilding resolved_pairs/semantic_findings, or a second
+        # `finalize` call (e.g. to layer in skeptic results) would silently
+        # see the pair as freshly pending again and either refuse or
+        # overwrite the real finding with a semantic-pass-not-run stand-in.
+        # Only the retry-counter bump and the validation-failure record for
+        # a *bad* line must stay one-shot, guarded by `is_new` below.
+        is_new = fp not in consumed_semantic
+        if is_new:
+            consumed_semantic.add(fp)
 
         resp, parse_err = _parse_response_line(raw_line)
         if parse_err:
-            new_validation_failures.append(
-                _mk_failure(None, "semantic", [parse_err], raw_line, rule_id=None))
+            if is_new:
+                new_validation_failures.append(
+                    _mk_failure(None, "semantic", [parse_err], raw_line,
+                               rule_id=None))
             continue
 
         rid = resp.get("record_id") if isinstance(resp.get("record_id"), str) \
@@ -933,17 +948,19 @@ def cmd_finalize(args):
 
         pair = (rid, ruleid)
         if pair not in semantic_pairs or pair in resolved_pairs:
-            new_validation_failures.append(
-                _mk_failure(rid, "semantic", ["no-such-request"], resp,
-                           rule_id=ruleid))
+            if is_new:
+                new_validation_failures.append(
+                    _mk_failure(rid, "semantic", ["no-such-request"], resp,
+                               rule_id=ruleid))
             continue
         record = records_by_id.get(rid)
         rule = rules_by_id.get(ruleid)
         m = state_by_id.get(rid)
         if record is None or rule is None or m is None:
-            new_validation_failures.append(
-                _mk_failure(rid, "semantic", ["no-such-request"], resp,
-                           rule_id=ruleid))
+            if is_new:
+                new_validation_failures.append(
+                    _mk_failure(rid, "semantic", ["no-such-request"], resp,
+                               rule_id=ruleid))
             resolved_pairs.add(pair)
             continue
         bad_types = _type_guard(
@@ -957,23 +974,24 @@ def cmd_finalize(args):
         else:
             errs = validate.validate_semantic_output(resp, record, rule)
         if errs:
-            n = m["semantic_failures"].get(ruleid, 0) + 1
-            m["semantic_failures"][ruleid] = n
-            m["retried"] = True
-            new_validation_failures.append(
-                _mk_failure(rid, "semantic", errs, resp, rule_id=ruleid))
-            if n >= 2:
+            if is_new:
+                n = m["semantic_failures"].get(ruleid, 0) + 1
+                m["semantic_failures"][ruleid] = n
+                m["retried"] = True
+                new_validation_failures.append(
+                    _mk_failure(rid, "semantic", errs, resp, rule_id=ruleid))
+                if n < 2:
+                    new_semantic_requests.append(
+                        {"record_id": rid, "rule_id": ruleid,
+                         "record": record, "rule": rule,
+                         "instructions_file": "prompts/semantic_compare.md",
+                         "retry": True, "previous_errors": errs})
+            if m["semantic_failures"].get(ruleid, 0) >= 2:
                 resolved_pairs.add(pair)
                 semantic_findings.append(_build_finding(
                     rid, record["row_id"], ruleid, "Cannot Assess",
                     "llm-output-rejected", False, None, None, None, [], m,
                     record, rule))
-            else:
-                new_semantic_requests.append(
-                    {"record_id": rid, "rule_id": ruleid, "record": record,
-                     "rule": rule,
-                     "instructions_file": "prompts/semantic_compare.md",
-                     "retry": True, "previous_errors": errs})
             continue
 
         resolved_pairs.add(pair)

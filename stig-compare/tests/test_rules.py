@@ -58,6 +58,17 @@ def test_same_level_conflict_suspends_both():
     assert set(conflicts[0]["rule_ids"]) == {"RL-a", "RL-b"}
 
 
+def test_identical_payload_same_level_not_conflict():
+    # Same category, same scope level, identical payloads (different key order)
+    # should NOT be a conflict; both rules should be applied
+    reg = {"registry_version": 1, "rules": [
+        _rule("RL-x", "global", None, payload={"a": "enabled", "b": "on"}),
+        _rule("RL-y", "global", None, payload={"b": "on", "a": "enabled"})]}
+    applied, conflicts = rules.applicable_rules(reg, _CTX)
+    assert set(r["rule_id"] for r in applied) == {"RL-x", "RL-y"}
+    assert conflicts == []
+
+
 def test_equivalent_by_rule():
     applied = [_rule("RL-1", "global", None)]
     assert rules.equivalent_by_rule(applied, "Turned On", "ENABLED") == "RL-1"

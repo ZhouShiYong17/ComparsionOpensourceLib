@@ -2,8 +2,20 @@
 
 Claude never talks to this module directly; it reads *_requests.jsonl and writes
 *_responses.jsonl. Everything it writes is validated before use.
+
+*_responses.jsonl files are Claude/attacker-controlled input and are read with
+tolerant, line-by-line parsing (see _read_response_lines/_parse_response_line):
+a malformed line never aborts the batch, it becomes a validation_failures.jsonl
+entry. common.read_jsonl (strict) is reserved for the pipeline's own artifacts.
+
+Every response line is also fingerprinted and recorded as "consumed" in
+consumed_responses.json before it is ever applied. Replaying an unchanged
+*_responses.jsonl file (the same Claude answer seen again on a later `resolve`/
+`finalize` invocation) is therefore a full no-op: it is neither re-applied nor
+re-logged as a fresh failure, and it never advances a retry counter.
 """
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime
@@ -35,12 +47,15 @@ _STRUCT_FIELDS = ["stig_description", "stig_objective_or_requirement",
 
 _MATCHED_TIERS = ("T0", "T1", "T2")
 
+_NO_RULE = object()  # sentinel: "this failure record has no rule_id field"
+
 
 # --------------------------------------------------------------------------
 # Small shared helpers
 # --------------------------------------------------------------------------
 
 def _read_jsonl_opt(path):
+    """Strict reader for the pipeline's own artifacts (never Claude-authored)."""
     path = Path(path)
     if not path.exists():
         return []
@@ -54,6 +69,87 @@ def _append_jsonl(path, new_records):
     existing = _read_jsonl_opt(path)
     existing.extend(new_records)
     common.write_jsonl(path, existing)
+
+
+def _read_response_lines(path):
+    """Tolerant raw-line reader for *_responses.jsonl (Claude-controlled input).
+
+    Returns the non-empty, stripped raw text of each line. Parsing happens
+    separately in _parse_response_line so a malformed line never raises here.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    lines = []
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            raw = raw.strip()
+            if raw:
+                lines.append(raw)
+    return lines
+
+
+def _parse_response_line(raw_line):
+    """Parse one *_responses.jsonl line. Never raises.
+
+    Returns (obj, None) on a well-formed JSON object, or (None, error_code)
+    where error_code is "malformed-json" (invalid JSON syntax, or valid JSON
+    that isn't an object) so the caller can record a validation failure
+    instead of crashing.
+    """
+    try:
+        obj = json.loads(raw_line)
+    except (json.JSONDecodeError, ValueError):
+        return None, "malformed-json"
+    if not isinstance(obj, dict):
+        return None, "malformed-json"
+    return obj, None
+
+
+def _type_guard(resp, str_fields, list_fields=()):
+    """Return the names of present fields whose type would crash downstream
+    string/list handling (e.g. common.fold_ws, len(), set()) -- present but
+    non-string (and not None) string fields, or present but non-list list
+    fields. Missing fields are left to the normal missing-key validation."""
+    bad = [k for k in str_fields
+          if k in resp and resp[k] is not None and not isinstance(resp[k], str)]
+    for k in list_fields:
+        if k in resp and not isinstance(resp[k], list):
+            bad.append(k)
+    return bad
+
+
+def _mk_failure(row_id, kind, errors, response, rule_id=_NO_RULE):
+    rec = {"row_id": row_id, "kind": kind, "errors": errors,
+           "response": response,
+           "timestamp": datetime.now().isoformat(timespec="seconds")}
+    if rule_id is not _NO_RULE:
+        rec["rule_id"] = rule_id
+    return rec
+
+
+def _consumed_path(run_dir):
+    return Path(run_dir) / "consumed_responses.json"
+
+
+def _load_consumed(run_dir):
+    p = _consumed_path(run_dir)
+    if p.exists():
+        data = json.loads(p.read_text(encoding="utf-8"))
+    else:
+        data = {}
+    for k in ("structuring", "matching", "semantic"):
+        data.setdefault(k, [])
+    return data
+
+
+def _save_consumed(run_dir, consumed):
+    _consumed_path(run_dir).write_text(json.dumps(consumed, indent=1),
+                                       encoding="utf-8")
+
+
+def _fingerprint(raw_line):
+    return hashlib.sha256(raw_line.encode("utf-8")).hexdigest()
 
 
 def _rule_text(rule):
@@ -215,6 +311,10 @@ def cmd_resolve(args):
         _ensure_match_fields(m)
     state_by_id = {m["row_id"]: m for m in match_state}
 
+    consumed = _load_consumed(run_dir)
+    consumed_structuring = set(consumed["structuring"])
+    consumed_matching = set(consumed["matching"])
+
     matching_requests_all = _read_jsonl_opt(run_dir / "matching_requests.jsonl")
     validation_failures_new = []
     new_matching_requests = []
@@ -222,32 +322,55 @@ def cmd_resolve(args):
     # ---- structuring pass ------------------------------------------------
     structuring_ok = 0
     structuring_failed = 0
-    for resp in _read_jsonl_opt(run_dir / "structuring_responses.jsonl"):
-        rid = resp.get("row_id")
-        row = rows_by_id.get(rid)
+    for raw_line in _read_response_lines(run_dir / "structuring_responses.jsonl"):
+        fp = _fingerprint(raw_line)
+        if fp in consumed_structuring:
+            continue                      # already-consumed replay -> no-op
+        consumed_structuring.add(fp)
+
+        resp, parse_err = _parse_response_line(raw_line)
+        if parse_err:
+            validation_failures_new.append(
+                _mk_failure(None, "structuring", [parse_err], raw_line))
+            continue
+
+        rid = resp.get("row_id") if isinstance(resp.get("row_id"), str) else None
+        row = rows_by_id.get(rid) if rid else None
         if row is None or row.get("status") != "needs-structuring":
             validation_failures_new.append(
-                {"row_id": rid, "kind": "structuring", "errors": ["no-such-request"],
-                 "timestamp": datetime.now().isoformat(timespec="seconds")})
+                _mk_failure(rid, "structuring", ["no-such-request"], resp))
             continue
+
         present = [k for k in _STRUCT_FIELDS if k in resp]
-        codes = [] if present else ["no-fields-extracted"]
-        for k in present:
-            if not validate.quote_exists(resp[k], row.get("original_company_text", "")):
-                codes.append(f"not-verbatim:{k}")
+        bad_types = _type_guard(resp, present)
+        if bad_types:
+            # A malformed field (wrong type) is treated the same as an
+            # unverifiable quote: this response is invalid input, not a
+            # crash. Structuring has no multi-strike retry, so it goes
+            # straight to extraction-failed like any other rejection.
+            codes = ["malformed-response"]
+        else:
+            codes = [] if present else ["no-fields-extracted"]
+            for k in present:
+                if not validate.quote_exists(resp[k], row.get("original_company_text", "")):
+                    codes.append(f"not-verbatim:{k}")
         if codes:
             structuring_failed += 1
             row["status"] = "extraction-failed"
             row["notes"] = "structuring-rejected:" + ",".join(codes)
             validation_failures_new.append(
-                {"row_id": rid, "kind": "structuring", "errors": codes,
-                 "timestamp": datetime.now().isoformat(timespec="seconds")})
+                _mk_failure(rid, "structuring", codes, resp))
             continue
+
         structuring_ok += 1
         for k in present:
             row[k] = resp[k]
         row["status"] = "ok"
         row["notes"] = ""
+        # The row's "normalized" cache (built once in cmd_start) is now stale
+        # for the fields Claude just filled in -- refresh it in place rather
+        # than leave a misleading pre-structuring snapshot on disk.
+        normalize.add_normalized([row], _COMPANY_NORM_FIELDS)
         # regenerate this row's tier/candidates now that fields are populated
         regen = candidates_mod.generate([row], official_rules)
         if regen:
@@ -273,24 +396,43 @@ def cmd_resolve(args):
         return requested_ids & {rid for rid, m in state_by_id.items()
                                  if m["tier"] is None}
 
-    for resp in _read_jsonl_opt(run_dir / "matching_responses.jsonl"):
-        rid = resp.get("row_id")
-        if rid not in _pending_ids():
+    for raw_line in _read_response_lines(run_dir / "matching_responses.jsonl"):
+        fp = _fingerprint(raw_line)
+        if fp in consumed_matching:
+            continue                      # already-consumed replay -> no-op
+        consumed_matching.add(fp)
+
+        resp, parse_err = _parse_response_line(raw_line)
+        if parse_err:
+            validation_failures_new.append(
+                _mk_failure(None, "matching", [parse_err], raw_line))
+            continue
+
+        rid = resp.get("row_id") if isinstance(resp.get("row_id"), str) else None
+        if rid is None or rid not in _pending_ids():
             no_such_request += 1
             validation_failures_new.append(
-                {"row_id": rid, "kind": "matching", "errors": ["no-such-request"],
-                 "timestamp": datetime.now().isoformat(timespec="seconds")})
+                _mk_failure(rid, "matching", ["no-such-request"], resp))
             continue
         m = state_by_id[rid]
         row = rows_by_id.get(rid)
-        shortlist_ids = [c["rule_id"] for c in m["candidates"]]
-        errs = validate.validate_match_output(resp, shortlist_ids, row, rules_by_id)
+        bad_types = _type_guard(
+            resp, ["decision", "rule_id", "row_quote", "rule_quote", "basis"],
+            ["ambiguous_rule_ids"])
+        if bad_types:
+            # A malformed field (wrong type) is invalid Claude output, not a
+            # crash -- it goes through the same retry-then-reject protocol
+            # as any other invalid response, so the two-strike counter still
+            # applies and a genuinely-corrected retry is still requested.
+            errs = ["malformed-response"]
+        else:
+            shortlist_ids = [c["rule_id"] for c in m["candidates"]]
+            errs = validate.validate_match_output(resp, shortlist_ids, row, rules_by_id)
         if errs:
             m["match_failures"] += 1
             m["retried"] = True
             validation_failures_new.append(
-                {"row_id": rid, "kind": "matching", "errors": errs,
-                 "timestamp": datetime.now().isoformat(timespec="seconds")})
+                _mk_failure(rid, "matching", errs, resp))
             if m["match_failures"] >= 2:
                 matching_rejected_final += 1
                 m["tier"] = "T4"
@@ -343,12 +485,22 @@ def cmd_resolve(args):
         rule_id = m["matched_rule_id"]
         rule = rules_by_id.get(rule_id)
         if row is None or rule is None:
+            # Matched to a rule_id that doesn't resolve to a real official rule
+            # (state corruption / shortlist-registry mismatch): never leave
+            # this silently unprocessed forever -- flag it and stop retrying.
+            m["verdict_done"] = True
+            m["warnings"].append("unknown-matched-rule")
             continue
         context = _context_for_row(row, doc_type, field="expected_value")
         applied, _ = rules_mod.applicable_rules(registry, context)
         observed_raw = row.get("observed_value_or_evidence", "")
         expected_raw = rule.get("expected_value", "")
-        eq_rule_id = rules_mod.equivalent_by_rule(applied, observed_raw, expected_raw)
+        eq_rule_id = None
+        if common.fold_ws(observed_raw):
+            # The equivalence shortcut must never override the missing-
+            # evidence hard rule: only consult it when there is evidence.
+            eq_rule_id = rules_mod.equivalent_by_rule(applied, observed_raw,
+                                                       expected_raw)
         applied_rules_list = []
         if eq_rule_id:
             result = {"verdict": "Compliant", "basis": "rule-equivalence",
@@ -379,6 +531,9 @@ def cmd_resolve(args):
     _append_jsonl(run_dir / "validation_failures.jsonl", validation_failures_new)
     _append_jsonl(run_dir / "findings.jsonl", new_findings)
     _append_jsonl(run_dir / "semantic_requests.jsonl", new_semantic_requests)
+    consumed["structuring"] = sorted(consumed_structuring)
+    consumed["matching"] = sorted(consumed_matching)
+    _save_consumed(run_dir, consumed)
 
     retries_pending = sum(1 for m in match_state
                           if m["tier"] is None and m["match_failures"] == 1)
@@ -422,6 +577,9 @@ def cmd_finalize(args):
         _ensure_match_fields(m)
     state_by_id = {m["row_id"]: m for m in match_state}
 
+    consumed = _load_consumed(run_dir)
+    consumed_semantic = set(consumed["semantic"])
+
     validation_failures = _read_jsonl_opt(run_dir / "validation_failures.jsonl")
     new_validation_failures = []
 
@@ -439,33 +597,51 @@ def cmd_finalize(args):
     semantic_findings = []
     new_semantic_requests = []
 
-    for resp in _read_jsonl_opt(run_dir / "semantic_responses.jsonl"):
-        rid, ruleid = resp.get("row_id"), resp.get("rule_id")
+    for raw_line in _read_response_lines(run_dir / "semantic_responses.jsonl"):
+        fp = _fingerprint(raw_line)
+        if fp in consumed_semantic:
+            continue                      # already-consumed replay -> no-op
+        consumed_semantic.add(fp)
+
+        resp, parse_err = _parse_response_line(raw_line)
+        if parse_err:
+            new_validation_failures.append(
+                _mk_failure(None, "semantic", [parse_err], raw_line, rule_id=None))
+            continue
+
+        rid = resp.get("row_id") if isinstance(resp.get("row_id"), str) else None
+        ruleid = resp.get("rule_id") if isinstance(resp.get("rule_id"), str) else None
+
         pair = (rid, ruleid)
         if pair not in semantic_pairs or pair in resolved_pairs:
             new_validation_failures.append(
-                {"row_id": rid, "rule_id": ruleid, "kind": "semantic",
-                 "errors": ["no-such-request"],
-                 "timestamp": datetime.now().isoformat(timespec="seconds")})
+                _mk_failure(rid, "semantic", ["no-such-request"], resp,
+                           rule_id=ruleid))
             continue
         row = rows_by_id.get(rid)
         rule = rules_by_id.get(ruleid)
         m = state_by_id.get(rid)
         if row is None or rule is None or m is None:
             new_validation_failures.append(
-                {"row_id": rid, "rule_id": ruleid, "kind": "semantic",
-                 "errors": ["no-such-request"],
-                 "timestamp": datetime.now().isoformat(timespec="seconds")})
+                _mk_failure(rid, "semantic", ["no-such-request"], resp,
+                           rule_id=ruleid))
             resolved_pairs.add(pair)
             continue
-        errs = validate.validate_semantic_output(resp, row, rule)
+        bad_types = _type_guard(
+            resp, ["finding_type", "verdict", "row_quote", "rule_quote",
+                   "interpretation"])
+        if bad_types:
+            # Same reasoning as the matching pass: a malformed field is
+            # invalid output, not a crash, and goes through the same
+            # two-strike retry-then-reject protocol.
+            errs = ["malformed-response"]
+        else:
+            errs = validate.validate_semantic_output(resp, row, rule)
         if errs:
             m["semantic_failures"] += 1
             m["retried"] = True
             new_validation_failures.append(
-                {"row_id": rid, "rule_id": ruleid, "kind": "semantic",
-                 "errors": errs,
-                 "timestamp": datetime.now().isoformat(timespec="seconds")})
+                _mk_failure(rid, "semantic", errs, resp, rule_id=ruleid))
             if m["semantic_failures"] >= 2:
                 resolved_pairs.add(pair)
                 semantic_findings.append(_build_finding(
@@ -488,13 +664,15 @@ def cmd_finalize(args):
     pending_semantic_pairs = sorted(semantic_pairs - resolved_pairs)
 
     # Persist the bookkeeping from this call's semantic-response processing
-    # (retry counters, requeued requests, validation failures) *before* any
-    # early return below. A refusal or coverage-abort must not silently
-    # discard work already done, or the two-strike retry counter would never
-    # advance across repeated `finalize` invocations.
+    # (retry counters, requeued requests, validation failures, consumed
+    # fingerprints) *before* any early return below. A refusal or coverage-
+    # abort must not silently discard work already done, or the two-strike
+    # retry counter would never advance across repeated `finalize` calls.
     common.write_jsonl(run_dir / "match_state.jsonl", list(state_by_id.values()))
     _append_jsonl(run_dir / "validation_failures.jsonl", new_validation_failures)
     _append_jsonl(run_dir / "semantic_requests.jsonl", new_semantic_requests)
+    consumed["semantic"] = sorted(consumed_semantic)
+    _save_consumed(run_dir, consumed)
 
     # ---- refusal gate -------------------------------------------------
     if (pending_matching_ids or pending_semantic_pairs) and not args.allow_pending:
@@ -506,7 +684,9 @@ def cmd_finalize(args):
     passnotrun_findings = []
     if args.allow_pending:
         for rid in pending_matching_ids:
-            m = state_by_id[rid]
+            m = state_by_id.get(rid)
+            if m is None:
+                continue
             m["tier"] = "T4"
             if "matching-pass-not-run" not in m["warnings"]:
                 m["warnings"].append("matching-pass-not-run")
@@ -530,8 +710,28 @@ def cmd_finalize(args):
     all_findings = det_findings + semantic_findings + passnotrun_findings
 
     # ---- skeptic merge -------------------------------------------------
-    skeptic_by_finding = {s["finding_id"]: s
-                          for s in _read_jsonl_opt(run_dir / "skeptic_responses.jsonl")}
+    # Tolerant read for crash-safety; naturally idempotent (re-merging the
+    # same outcome onto the same finding_id is a no-op), so no fingerprinting
+    # is needed here -- only parse/type safety.
+    skeptic_by_finding = {}
+    skeptic_malformed = []
+    for raw_line in _read_response_lines(run_dir / "skeptic_responses.jsonl"):
+        resp, parse_err = _parse_response_line(raw_line)
+        if parse_err:
+            skeptic_malformed.append(
+                _mk_failure(None, "skeptic", [parse_err], raw_line))
+            continue
+        fid = resp.get("finding_id") if isinstance(resp.get("finding_id"), str) \
+            else None
+        outcome = resp.get("outcome")
+        if fid is None or not isinstance(outcome, str):
+            skeptic_malformed.append(
+                _mk_failure(None, "skeptic", ["malformed-response"], resp))
+            continue
+        skeptic_by_finding[fid] = resp
+    if skeptic_malformed:
+        _append_jsonl(run_dir / "validation_failures.jsonl", skeptic_malformed)
+
     for f in all_findings:
         s = skeptic_by_finding.get(f["finding_id"])
         if s is not None:
@@ -543,15 +743,25 @@ def cmd_finalize(args):
     contradictions = validate.find_contradictions(kept)
 
     # ---- coverage --------------------------------------------------------
+    # Rows still stuck in needs-structuring (never answered, or rejected with
+    # no further retry) must land in coverage's needs_structuring_unresolved
+    # bucket. candidates.generate() emits a match_state record for them too
+    # (so T0/T1 raw-text detection still runs pre-structuring), which would
+    # otherwise make that bucket unreachable -- exclude them from what
+    # coverage sees so `rid not in by_row` is true for every such row.
+    match_state_for_coverage = [
+        m for m in match_state
+        if rows_by_id.get(m["row_id"], {}).get("status") != "needs-structuring"]
     ignored_row_ids = _ignored_row_ids(registry, company_rows, doc_type)
-    coverage = coverage_mod.compute(company_rows, official_rules, match_state,
-                                    ignored_row_ids)
+    coverage = coverage_mod.compute(company_rows, official_rules,
+                                    match_state_for_coverage, ignored_row_ids)
     if not coverage["ok"]:
         print(f"finalize: aborted - coverage not ok: {coverage['warnings']}")
         return 3
 
     # ---- validation-failure and rule-conflict lookups for review flags --
-    all_validation_failures = validation_failures + new_validation_failures
+    all_validation_failures = (validation_failures + new_validation_failures +
+                               skeptic_malformed)
     validation_failed_row_ids = {vf["row_id"] for vf in all_validation_failures}
     duplicate_rule_ids = set(coverage["official"]["duplicate_coverage_rule_ids"])
     global_conflict = bool(manifest.get("rule_conflicts"))
@@ -623,6 +833,18 @@ def cmd_finalize(args):
          "expected_value": r.get("expected_value", "")}
         for r in official_rules if r["rule_id"] not in matched_rule_ids]
 
+    # Rows that never reached a comparable state at all (still stuck in
+    # needs-structuring, or knocked out to extraction-failed) -- these are
+    # invisible to `unmatched_rows` (which only covers status=="ok" rows) and
+    # to `findings`, so surface them explicitly for the report/audit trail.
+    unresolved_rows = [
+        {"row_id": r["row_id"], "status": r.get("status"),
+         "notes": r.get("notes", ""),
+         "source_reference": r.get("source_reference", {}),
+         "original_company_text": r.get("original_company_text", "")}
+        for r in company_rows
+        if r.get("status") in ("needs-structuring", "extraction-failed")]
+
     # ---- top-level warnings ----------------------------------------------
     extract_warnings = json.loads(
         (run_dir / "extract_warnings.json").read_text(encoding="utf-8")) \
@@ -642,14 +864,16 @@ def cmd_finalize(args):
         "unmatched_rows": unmatched_rows,
         "unaddressed_rules": unaddressed_rules,
         "ambiguous": ambiguous,
+        "unresolved_rows": unresolved_rows,
     }
     (run_dir / "final.json").write_text(json.dumps(final, indent=1),
                                         encoding="utf-8")
 
     # ---- persist post-finalize mutations (allow-pending tier/warning changes) --
-    # (validation_failures.jsonl / semantic_requests.jsonl were already persisted
-    # above, before the refusal/coverage gates; re-persist only match_state here
-    # to capture the allow-pending tier="T4" / matching-pass-not-run mutations.)
+    # (validation_failures.jsonl / semantic_requests.jsonl / consumed
+    # fingerprints were already persisted above, before the refusal/coverage
+    # gates; re-persist only match_state here to capture the allow-pending
+    # tier="T4" / matching-pass-not-run mutations.)
     common.write_jsonl(run_dir / "match_state.jsonl", match_state)
 
     if not args.no_report:

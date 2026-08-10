@@ -63,3 +63,29 @@ def test_needs_structuring_unresolved_counts():
     matches = [_match("R-00000000", "T4")]
     cov = coverage.compute(rows, _rules(1), matches, set())
     assert cov["company"]["needs_structuring_unresolved"] == 1
+
+
+def test_needs_structuring_with_match_counts_by_tier():
+    rows = _rows(2)
+    rows[1]["status"] = "needs-structuring"
+    matches = [_match("R-00000000", "T4"),
+               _match("R-00000001", "T2", "V-1000")]
+    cov = coverage.compute(rows, _rules(1), matches, set())
+    c = cov["company"]
+    assert c["matched"] == 1
+    assert c["needs_structuring_unresolved"] == 0
+    assert cov["ok"] is True
+
+
+def test_ignored_by_rule_bucket():
+    rows = _rows(2)
+    matches = [_match("R-00000001", "T4")]
+    cov = coverage.compute(rows, _rules(1), matches, {"R-00000000"})
+    c = cov["company"]
+    assert c["ignored_by_rule"] == 1
+    assert c["unmatched"] == 1
+    bucket_sum = (c["matched"] + c["ambiguous"] + c["unmatched"] +
+                  c["ignored_by_rule"] + c["extraction_failed"] +
+                  c["needs_structuring_unresolved"])
+    assert bucket_sum == c["total"]
+    assert cov["ok"] is True

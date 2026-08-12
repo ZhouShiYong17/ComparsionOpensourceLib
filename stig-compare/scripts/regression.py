@@ -96,7 +96,6 @@ def evaluate_replay(package_root, replay_dir):
         if req is None or cid in seen:
             invalid.append({"errors": ["no-such-request"], "id": cid})
             continue
-        seen.add(cid)
         row = req["official_rows"][0]
         errs = validate.validate_comparison_output(
             resp, req["record"], {row["official_row_id"]: row},
@@ -104,6 +103,7 @@ def evaluate_replay(package_root, replay_dir):
         if errs:
             invalid.append({"errors": errs, "id": cid})
             continue
+        seen.add(cid)
         case = cases_by_id.get(req["case_id"], {})
         snap = case.get("snapshot", {})
         fresh = resp["per_rule"][0]

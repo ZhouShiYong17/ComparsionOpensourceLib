@@ -62,3 +62,18 @@ def test_record_id_varies_by_sub_index():
     a = common.record_id(1, 2, 0, "text")
     b = common.record_id(1, 2, 1, "text")
     assert a != b
+
+
+def test_official_row_id_stable_and_prefixed():
+    a = common.official_row_id("f.csv", "csv,row=2", ["V-1", "title"])
+    b = common.official_row_id("f.csv", "csv,row=2", ["V-1", "title"])
+    assert a == b
+    assert a.startswith("OR-") and len(a) == 3 + 8
+    assert a != common.official_row_id("f.csv", "csv,row=3", ["V-1", "title"])
+    assert a != common.official_row_id("f.csv", "csv,row=2", ["V-1", "other"])
+
+
+def test_rollup_id_prefixed():
+    a = common.rollup_id("OR-12345678")
+    assert a.startswith("RU-") and len(a) == 3 + 8
+    assert a == common.rollup_id("OR-12345678")

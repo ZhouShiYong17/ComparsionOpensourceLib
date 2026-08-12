@@ -1,64 +1,97 @@
 import pytest
 
-from fixtures.build_fixtures import build_all
 import extract
+from fixtures import build_fixtures
 
 
 @pytest.fixture(scope="module")
-def fx(tmp_path_factory):
-    return build_all(tmp_path_factory.mktemp("fx"))
+def paths(tmp_path_factory):
+    return build_fixtures.build_all(tmp_path_factory.mktemp("fx"))
 
 
-@pytest.mark.parametrize("key", ["official_csv", "official_json", "official_xlsx"])
-def test_extract_official_all_formats(fx, key):
-    result = extract.extract_official(fx[key])
-    records = result["records"]
-    assert len(records) == 5
-    by_id = {r["rule_id"]: r for r in records}
-    assert "password_reuse_max" in by_id["V-1001"]["check_text"]
-    assert by_id["V-1001"]["expected_value"] == "9 or more"
-    assert by_id["V-1001"]["severity"] == "high"
-    assert result["warnings"] == []
-    assert records[0]["provenance"]["source_file"] == fx[key].name
+def test_csv_keeps_all_columns_verbatim(paths):
+    result = extract.extract_official(paths["official_csv"])
+    rows = result["rows"]
+    assert len(rows) == 5
+    r = rows[0]
+    assert r["headers"] == ["Rule ID", "Title", "Severity", "Check Text",
+                            "Fix Text", "Expected Value"]
+    assert len(r["cells"]) == 6
+    assert r["raw_record"]["Rule ID"] == "V-1001"
+    assert r["raw_record"]["Fix Text"] == \
+        "Set password_reuse_max to 9 or more."
+    # Severity is NOT lowercased or otherwise touched.
+    assert r["raw_record"]["Severity"] == "high"
+    assert r["cells"] == [r["raw_record"][h] for h in r["headers"]]
 
 
-def test_duplicate_rule_ids_warn(fx):
-    result = extract.extract_official(fx["official_dup_ids_csv"])
-    codes = [w["code"] for w in result["warnings"]]
-    assert "duplicate-rule-id" in codes
-    assert len(result["records"]) == 2      # both kept, never dropped
+def test_no_canonical_reduction_or_display_id(paths):
+    result = extract.extract_official(paths["official_csv"])
+    r = result["rows"][0]
+    # Column semantics are the LLM structure pass's job, not extraction's.
+    assert r["display_id"] is None
+    assert r["column_roles"] is None
+    assert "rule_id" not in r
+    assert not hasattr(extract, "OFFICIAL_HEADER_SYNONYMS")
 
 
-def test_empty_official_warns(tmp_path):
-    p = tmp_path / "empty.csv"
-    p.write_text("Rule ID,Title\n", encoding="utf-8")
+def test_official_row_ids_stable_and_unique(paths):
+    a = extract.extract_official(paths["official_csv"])["rows"]
+    b = extract.extract_official(paths["official_csv"])["rows"]
+    ids_a = [r["official_row_id"] for r in a]
+    ids_b = [r["official_row_id"] for r in b]
+    assert ids_a == ids_b
+    assert len(set(ids_a)) == len(ids_a)
+    assert all(i.startswith("OR-") for i in ids_a)
+
+
+def test_provenance_and_row_numbers(paths):
+    rows = extract.extract_official(paths["official_csv"])["rows"]
+    assert rows[0]["provenance"]["locator"] == "csv,row=2"
+    assert rows[0]["row_number"] == 2
+    assert rows[0]["sheet_or_section"] == "csv"
+
+
+def test_xlsx_per_sheet(paths):
+    rows = extract.extract_official(paths["official_xlsx"])["rows"]
+    assert len(rows) == 5
+    assert rows[0]["sheet_or_section"] == "sheet=Rules"
+    assert rows[0]["provenance"]["locator"] == "sheet=Rules,row=2"
+
+
+def test_json_keeps_all_keys(paths):
+    rows = extract.extract_official(paths["official_json"])["rows"]
+    assert len(rows) == 5
+    assert rows[0]["raw_record"]["rule_id"] == "V-1001"
+    assert rows[0]["headers"] == list(build_fixtures.OFFICIAL_RULES[0].keys())
+    assert rows[0]["provenance"]["locator"] == "json,index=0"
+
+
+def test_duplicate_and_empty_headers_disambiguated(tmp_path):
+    p = tmp_path / "dup.csv"
+    p.write_text("A,,A\n1,2,3\n", encoding="utf-8")
+    rows = extract.extract_official(p)["rows"]
+    raw = rows[0]["raw_record"]
+    assert len(raw) == 3            # nothing shadowed
+    assert raw["A"] == "1"
+    assert raw["col1"] == "2"
+    assert raw["A#col2"] == "3"
+
+
+def test_blank_rows_skipped_and_empty_file_warns(tmp_path):
+    p = tmp_path / "e.csv"
+    p.write_text("A,B\n , \n", encoding="utf-8")
     result = extract.extract_official(p)
-    assert result["records"] == []
-    assert any(w["code"] == "empty-official-file" for w in result["warnings"])
+    assert result["rows"] == []
+    p2 = tmp_path / "empty.csv"
+    p2.write_text("A,B\n", encoding="utf-8")
+    result2 = extract.extract_official(p2)
+    assert any(w["code"] == "empty-official-file"
+               for w in result2["warnings"])
 
 
-def test_csv_with_blank_rows_warns(tmp_path):
-    p = tmp_path / "blank_rows.csv"
-    p.write_text("Rule ID,Title\n\n  \n", encoding="utf-8")
-    result = extract.extract_official(p)
-    assert result["records"] == []
-    assert any(w["code"] == "empty-official-file" for w in result["warnings"])
-
-
-def test_json_with_unmapped_keys_warns(tmp_path):
-    # Minor finding 7: records parse, but none of their keys match any
-    # canonical field name -- every mapped field of every record is empty.
-    # Must not silently produce N all-blank records with zero warnings.
-    import json
-    p = tmp_path / "unmapped.json"
-    p.write_text(json.dumps([
-        {"identifier": "V-1001", "name": "Password reuse"},
-        {"identifier": "V-1002", "name": "Password age"},
-    ]), encoding="utf-8")
-    result = extract.extract_official(p)
-    assert len(result["records"]) == 2
-    assert all(not r["rule_id"] and not r["title"] for r in result["records"])
-    codes = [w["code"] for w in result["warnings"]]
-    assert "unmapped-json-keys" in codes
-    w = next(w for w in result["warnings"] if w["code"] == "unmapped-json-keys")
-    assert "2" in w["detail"]
+def test_unsupported_suffix_raises(tmp_path):
+    bad = tmp_path / "x.txt"
+    bad.write_text("hi", encoding="utf-8")
+    with pytest.raises(ValueError):
+        extract.extract_official(bad)

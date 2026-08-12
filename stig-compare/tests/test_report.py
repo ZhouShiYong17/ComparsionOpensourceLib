@@ -1,194 +1,196 @@
 import json
-import re
-from pathlib import Path
 
 import report
 
 
-def _final(tmp_path):
-    final = {
-        "manifest": {"official_file": "o.csv", "company_file": "c.docx",
-                     "official_sha256": "a" * 64, "company_sha256": "b" * 64,
-                     "started": "2026-08-10T12:00:00",
-                     "versions": {"skill_version": "0.1.0", "prompt_hashes": {}},
-                     "registry_version": 1, "rule_conflicts": []},
-        "findings": [{
-            "finding_id": "F-11112222", "row_id": "R-aaaa0001",
-            "rule_id": "V-1001", "verdict": "Compliant",
-            "finding_type": None, "deterministic": True,
-            "confidence": "High", "human_review_needed": False,
-            "basis": "value-comparison",
-            "observation": {"observed": "9", "expected": "9 or more"},
-            "interpretation": None, "skeptic": None, "applied_rules": [],
-            "match": {"tier": "T1", "candidates": [
-                {"rule_id": "V-1001", "score": 3.2}]},
-            "company_row": {"original_company_text":
-                            "High | <b>reuse</b> | 9",
-                            "source_reference": {"table_index": 1,
-                                                 "row_index": 1}},
-            "official_rule": {"rule_id": "V-1001", "title": "Password reuse",
-                              "check_text": "check", "expected_value": "9 or more"}},
-            {
-            "finding_id": "F-33334444", "row_id": "R-bbbb0002",
-            "rule_id": "V-1002", "verdict": "Non-Compliant",
-            "finding_type": "weaker", "deterministic": False,
-            "confidence": "Medium", "human_review_needed": True,
-            "basis": "semantic-comparison",
-            "observation": {"row_quote": "60 days",
-                            "rule_quote": "no greater than 60 days"},
-            "interpretation": "Company policy uses a coarser boundary than "
-                              "the official rule requires.",
-            "skeptic": None, "applied_rules": [],
-            "match": {"tier": "T2", "candidates": []},
-            "company_row": {"original_company_text":
-                            "Medium | rotate passwords | 60 days",
-                            "source_reference": {"table_index": 1,
-                                                 "row_index": 2}},
-            "official_rule": {"rule_id": "V-1002", "title": "Max password age",
-                              "check_text": "check", "expected_value":
-                              "60 days or less"}}],
-        "match_state": [], "ambiguous": [],
-        "coverage": {"company": {"total": 1, "matched": 1, "ambiguous": 0,
-                                 "unmatched": 0, "ignored_by_rule": 0,
-                                 "extraction_failed": 0,
-                                 "needs_structuring_unresolved": 0},
-                     "official": {"total": 5, "addressed": 1, "unaddressed": 4,
-                                  "duplicate_coverage_rule_ids": []},
-                     "warnings": [{"code": "low-coverage-red-banner",
-                                   "detail": "2/10 rows not compared"}],
-                     "ok": True},
-        "warnings": [], "unmatched_rows": [], "unaddressed_rules": []}
-    (tmp_path / "final.json").write_text(json.dumps(final), encoding="utf-8")
-    return tmp_path
+def _finding():
+    return {
+        "finding_id": "F-1", "record_id": "CR-1", "row_id": "R-1",
+        "official_row_id": "OR-1", "display_id": "V-1001",
+        "verdict": "Deviating", "first_pass_verdict": "Compliant",
+        "verdict_source": "validation-revised",
+        "change_analysis": ["weakened"],
+        "match_rationale": "same control subject",
+        "semantic_differences": "company version is less strict",
+        "reasoning": "the approved setting is lower",
+        "field_alignment": [
+            {"company_ref": "APPROVED SETTING", "official_column":
+             "Expected Value", "company_quote": "5",
+             "official_quote": "9 or more", "relation": "differs"}],
+        "row_quote": "<b>reuse</b> must be restricted",
+        "official_quote": "Password reuse must be restricted",
+        "confidence": "Medium", "human_review": False,
+        "human_review_needed": True,
+        "review_reasons": ["validation-revised"],
+        "claim_reading": "deviation", "claim_consistency": "contradicted",
+        "record_notes": "", "sweep_originated": True,
+        "comparison_split": False,
+        "validation": {"outcome": "revised",
+                       "independent_verdict": "Deviating",
+                       "revised_verdict": "Deviating",
+                       "reason": "evidence shows a weaker setting",
+                       "evidence_quote": "5"},
+        "disputed": False,
+        "match_basis": {"basis": "same parameter", "row_quote": "x",
+                        "official_quote": "y"},
+        "company_row": {
+            "record_id": "CR-1", "row_id": "R-1",
+            "header_row": ["REQ", "APPROVED SETTING"],
+            "cells": ["<b>reuse</b> must be restricted", "5"],
+            "continuation_cells": [{"row_index": 2,
+                                    "cells": ["continued cell text"]}],
+            "merged": False, "preceding_narrative": "JB.1.1 NARRATIVE",
+            "context_grouping": "JB.1.1 NARRATIVE",
+            "canonical_fields": {"stig_description": "x"},
+            "field_provenance": {}, "interpretation_note": "reviewer note",
+            "company_claim_reading": "deviation",
+            "original_company_text": "<b>reuse</b> must be restricted | 5",
+            "status": "ok", "notes": "",
+            "source_reference": {"table_index": 3, "row_index": 1,
+                                 "sub_index": 0}},
+        "official_row": {
+            "official_row_id": "OR-1", "display_id": "V-1001",
+            "headers": ["Rule ID", "Title"],
+            "cells": ["V-1001", "Password reuse must be restricted"],
+            "raw_record": {"Rule ID": "V-1001",
+                           "Title": "Password reuse must be restricted"},
+            "sheet_or_section": "csv", "row_number": 2,
+            "provenance": {"source_file": "official.csv",
+                           "locator": "csv,row=2"},
+            "column_roles": {"Rule ID": "id", "Title": "title"}},
+    }
 
 
-def test_render_self_contained(tmp_path):
-    out = report.render(_final(tmp_path))
-    html_text = Path(out).read_text(encoding="utf-8")
-    assert "https://" not in html_text and "http://" not in html_text
-    assert "F-11112222" in html_text
-    assert "CONTAINS SENSITIVE DOCUMENT CONTENT" in html_text
+def _final():
+    return {
+        "manifest": {"official_file": "official.csv",
+                     "company_file": "company.docx",
+                     "official_sha256": "a" * 64,
+                     "company_sha256": "b" * 64,
+                     "started": "2026-08-12T00:00:00",
+                     "versions": {"skill_version": "0.3.0",
+                                  "prompt_hashes": {"comparison.md": "c" * 64}}},
+        "findings": [_finding()],
+        "rule_rollups": [
+            {"rollup_id": "RU-1", "official_row_id": "OR-1",
+             "display_id": "V-1001",
+             "contributing_record_ids": ["CR-1", "CR-2"],
+             "verdict": "Compliant",
+             "coverage_of_requirement": "fully-covered",
+             "reasoning": "jointly satisfied", "confidence": "High",
+             "human_review": False,
+             "validation": {"status": "validation-not-run"},
+             "human_review_needed": True,
+             "review_reasons": ["validation-not-run"], "oversized": False}],
+        "match_state": [],
+        "coverage": {
+            "company": {"total": 4, "matched": 1, "ambiguous": 1,
+                        "unmatched": 1, "unresolved": 1,
+                        "ignored_irrelevant_table": 0, "separator": 0,
+                        "extraction_failed": 0},
+            "official": {"total": 2, "addressed": 1, "unaddressed": 1,
+                         "multi_matched_row_ids": ["OR-1"]},
+            "warnings": [{"code": "low-coverage-red-banner",
+                          "detail": "2/4 rows not compared"}],
+            "ok": True},
+        "warnings": [{"code": "rollup-verdict-differs", "detail": "OR-1"}],
+        "unmatched_rows": [
+            {"record_id": "CR-3", "original_company_text": "plain row",
+             "source_reference": {}, "basis": "no-nominations",
+             "warnings": []}],
+        "ambiguous": [
+            {"record_id": "CR-4", "original_company_text": "ambiguous row",
+             "source_reference": {},
+             "ambiguous_official_row_ids": ["OR-1", "OR-2"],
+             "basis": "cannot discriminate"}],
+        "unresolved_rows": [
+            {"record_id": "CR-5", "status": "match-pass-not-run",
+             "notes": "", "source_reference": {},
+             "original_company_text": "unresolved row"}],
+        "unresolved_pairs": [
+            {"record_id": "CR-1", "official_row_id": "OR-9",
+             "status": "comparison-pass-not-run"}],
+        "unaddressed_rules": [
+            {"official_row_id": "OR-2", "display_id": "V-1002",
+             "headers": ["Rule ID"], "cells": ["V-1002"],
+             "raw_record": {"Rule ID": "V-1002", "Title": "Other rule"},
+             "sheet_or_section": "csv", "row_number": 3,
+             "provenance": {"source_file": "official.csv",
+                            "locator": "csv,row=3"},
+             "column_roles": None}],
+        "table_triage": [
+            {"table_index": 3, "sheet_or_section": "document-body",
+             "classification": "stig_relevant", "irrelevant_reason": "",
+             "context_grouping": "JB.1.1 NARRATIVE", "row_count": 2,
+             "column_mapping": {"0": "stig_description"}}],
+    }
 
 
-def test_document_text_is_escaped(tmp_path):
-    html_text = Path(report.render(_final(tmp_path))).read_text(encoding="utf-8")
-    assert "<b>reuse</b>" not in html_text          # raw tag must not survive
-    assert "&lt;b&gt;reuse&lt;/b&gt;" in html_text
+def _render(tmp_path, final=None):
+    (tmp_path / "final.json").write_text(
+        json.dumps(final or _final()), encoding="utf-8")
+    out = report.render(tmp_path)
+    return out.read_text(encoding="utf-8")
+
+
+def test_self_contained_and_escaped(tmp_path):
+    html = _render(tmp_path)
+    assert "http://" not in html and "https://" not in html
+    assert "<b>reuse</b>" not in html
+    assert "&lt;b&gt;reuse&lt;/b&gt;" in html
 
 
 def test_red_banner_never_in_details(tmp_path):
-    html_text = Path(report.render(_final(tmp_path))).read_text(encoding="utf-8")
-    assert "red-banner" in html_text
-    warnings_section = re.search(
-        r"<section id=\"warnings\">.*?</section>", html_text, re.S).group(0)
-    assert "<details" not in warnings_section
+    html = _render(tmp_path)
+    assert "red-banner" in html
+    before_banner = html.split("red-banner")[0]
+    assert before_banner.count("<details") == before_banner.count("</details>")
 
 
-def test_feedback_widgets_present(tmp_path):
-    html_text = Path(report.render(_final(tmp_path))).read_text(encoding="utf-8")
-    assert 'class="fb"' in html_text
-    assert "wrong match" in html_text
-    assert "Export feedback" in html_text
-    assert "data-fid=\"F-11112222\"" in html_text
+def test_finding_full_row_evidence(tmp_path):
+    html = _render(tmp_path)
+    assert "JB.1.1 NARRATIVE" in html          # narrative context
+    assert "continued cell text" in html       # continuation row rendered
+    assert "APPROVED SETTING" in html          # company headers
+    assert "Password reuse must be restricted" in html
+    assert "csv,row=2" in html                 # official provenance
+    assert "Field alignment" in html
+    assert 'data-verdict="Deviating"' in html
 
 
-def test_semantic_finding_shows_finding_type_and_interpretation(tmp_path):
-    # Important finding 2: the report must surface both finding_type (so the
-    # "wrong classification" feedback option is meaningful) and the
-    # interpretation ("reason") for a semantic finding.
-    html_text = Path(report.render(_final(tmp_path))).read_text(encoding="utf-8")
-    assert "weaker" in html_text
-    assert "Interpretation" in html_text
-    assert ("Company policy uses a coarser boundary than the official rule "
-           "requires.") in html_text
-
-    # And a deterministic finding with finding_type/interpretation both None
-    # must render neither block -- no stray "None" text or empty label.
-    art = re.search(
-        r'<article class="finding" data-fid="F-11112222".*?</article>',
-        html_text, re.S).group(0)
-    assert "Interpretation" not in art
-
-
-def _minimal_final(tmp_path):
-    """Minimal final.json structure for triage/claim badge tests."""
-    final = {
-        "manifest": {"official_file": "o.csv", "company_file": "c.docx",
-                     "official_sha256": "a" * 64, "company_sha256": "b" * 64,
-                     "started": "2026-08-10T12:00:00",
-                     "versions": {"skill_version": "0.1.0", "prompt_hashes": {}},
-                     "registry_version": 1, "rule_conflicts": []},
-        "findings": [{
-            "finding_id": "F-11112222", "row_id": "R-aaaa0001",
-            "record_id": "CR-1",
-            "rule_id": "V-1001", "verdict": "Compliant",
-            "finding_type": None, "deterministic": True,
-            "confidence": "High", "human_review_needed": False,
-            "basis": "value-comparison",
-            "observation": {"observed": "9", "expected": "9 or more"},
-            "interpretation": None, "skeptic": None, "applied_rules": [],
-            "match": {"tier": "T1", "candidates": [
-                {"rule_id": "V-1001", "score": 3.2}]},
-            "company_row": {"original_company_text":
-                            "High | <b>reuse</b> | 9",
-                            "source_reference": {"table_index": 1,
-                                                 "row_index": 1}},
-            "official_rule": {"rule_id": "V-1001", "title": "Password reuse",
-                              "check_text": "check", "expected_value": "9 or more"},
-            "claim_flags": ["company-declared-deviation", "claim-contradicted"],
-            "claim_normalized": "deviation",
-            "company_compliance_claim": "DEVIATION",
-            "interpretation_note": "reviewer note",
-            "sweep_originated": True}],
-        "table_triage": [
-            {"table_index": 1, "sheet_or_section": "document-body",
-             "classification": "irrelevant", "irrelevant_reason": "instructions",
-             "context_grouping": "", "row_count": 3, "column_mapping": {}},
-            {"table_index": 2, "sheet_or_section": "document-body",
-             "classification": "stig_relevant", "irrelevant_reason": "",
-             "context_grouping": "JB.1.1", "row_count": 5,
-             "column_mapping": {"0": "stig_description"}}],
-        "match_state": [],
-        "ambiguous": [{
-            "record_id": "CR-amb1",
-            "original_company_text": "ambiguous text",
-            "source_reference": {"table_index": 1, "row_index": 3},
-            "ambiguous_rule_ids": ["V-2001", "V-2002"],
-            "candidates": []}],
-        "unmatched_rows": [{
-            "record_id": "CR-unm1",
-            "original_company_text": "unmatched text",
-            "source_reference": {"table_index": 1, "row_index": 4},
-            "warnings": []}],
-        "unresolved_rows": [{
-            "record_id": "CR-unr1",
-            "original_company_text": "unresolved text",
-            "source_reference": {"table_index": 1, "row_index": 5},
-            "status": "needs-structuring-unresolved",
-            "notes": "needs structuring"}],
-        "coverage": {"company": {"total": 1, "matched": 1, "ambiguous": 0,
-                                 "unmatched": 0, "ignored_by_rule": 0,
-                                 "extraction_failed": 0,
-                                 "needs_structuring_unresolved": 0},
-                     "official": {"total": 5, "addressed": 1, "unaddressed": 4,
-                                  "duplicate_coverage_rule_ids": []},
-                     "warnings": [], "ok": True},
-        "warnings": [], "unaddressed_rules": []}
-    (tmp_path / "final.json").write_text(json.dumps(final), encoding="utf-8")
-    return tmp_path
-
-
-def test_report_renders_triage_and_claim_badges(tmp_path):
-    run_dir = _minimal_final(tmp_path)
-    report.render(run_dir)
-    html = (run_dir / "report.html").read_text(encoding="utf-8")
-    assert "Table triage" in html
-    assert "irrelevant" in html and "instructions" in html
+def test_validation_and_revised_badges(tmp_path):
+    html = _render(tmp_path)
+    assert "REVISED by validation" in html
+    assert "first pass: Compliant" in html
+    assert "Independent verdict" in html
+    assert "weakened" in html                  # change-analysis badge
+    assert "Review reasons" in html
     assert "company-declared-deviation" in html
     assert "claim-contradicted" in html
-    assert "Interpretation (not evidence)" in html
     assert "sweep-originated" in html
-    # Verify record_id appears in leftover sections
-    assert "CR-amb1" in html
-    assert "CR-unm1" in html
-    assert "CR-unr1" in html
+
+
+def test_rollup_and_leftover_sections(tmp_path):
+    html = _render(tmp_path)
+    assert "Rule rollups" in html
+    assert "RU-1" in html
+    assert "validation-not-run" in html
+    assert "Unresolved pairs" in html
+    assert "comparison-pass-not-run" in html
+    assert "CR-3" in html and "CR-4" in html and "CR-5" in html
+    assert "V-1002" in html                    # unaddressed keeps identity
+    assert "Other rule" in html                # ... and all columns
+
+
+def test_feedback_widgets_on_findings_and_rollups(tmp_path):
+    html = _render(tmp_path)
+    assert html.count('class="fb"') == 2       # one finding + one rollup
+    assert "Export feedback" in html
+
+
+def test_dashboard_five_verdict_tiles(tmp_path):
+    html = _render(tmp_path)
+    for v in ("Compliant", "Deviating", "Incomplete", "Ambiguous",
+              "Cannot Assess"):
+        assert v in html
+    assert "Unresolved" in html

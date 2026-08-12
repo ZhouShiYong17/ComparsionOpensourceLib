@@ -21,8 +21,17 @@ def record_id(table_index, row_index, sub_index, raw_text):
     return "CR-" + short_hash(table_index, row_index, sub_index, raw_text)
 
 
-def finding_id(rid, rule_id, finding_type):
-    return "F-" + short_hash(rid, rule_id, finding_type)
+def official_row_id(source_file, locator, cells):
+    return "OR-" + short_hash(source_file, locator,
+                              _SEP.join(str(c) for c in cells))
+
+
+def finding_id(rid, official_row_id_, kind):
+    return "F-" + short_hash(rid, official_row_id_, kind)
+
+
+def rollup_id(official_row_id_):
+    return "RU-" + short_hash(official_row_id_)
 
 
 def fold_ws(text):

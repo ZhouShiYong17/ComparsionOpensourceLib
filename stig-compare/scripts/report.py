@@ -1,4 +1,4 @@
-"""Self-contained HTML report. Verification-first (spec section 8).
+"""Self-contained HTML report. Verification-first.
 
 Every piece of document text passes through esc(). No external assets: the
 whole document -- markup, one <style> block, one <script> block -- lives in
@@ -21,7 +21,8 @@ def esc(x):
 _FEEDBACK_OPTIONS = ["", "correct", "incorrect", "wrong match",
                      "missed difference", "not meaningful",
                      "wrong classification", "other"]
-_VERDICTS = ["Compliant", "Non-Compliant", "Cannot Assess"]
+_VERDICTS = ["Compliant", "Deviating", "Incomplete", "Ambiguous",
+             "Cannot Assess"]
 _CONFIDENCES = ["High", "Medium", "Low"]
 
 _CSS = """
@@ -43,7 +44,7 @@ section{margin:1.6rem 0}
 .tile{background:#fff;border:1px solid #d0d5dd;border-radius:8px;
       padding:.8rem 1.2rem;min-width:8rem;text-align:center}
 .tile b{display:block;font-size:1.6rem}
-.finding{background:#fff;border:1px solid #d0d5dd;border-radius:8px;
+.finding,.rollup{background:#fff;border:1px solid #d0d5dd;border-radius:8px;
          padding:1rem;margin:.8rem 0}
 .leftover-card{background:#fff;border:1px solid #d0d5dd;border-radius:8px;
                padding:.7rem 1rem;margin:.6rem 0}
@@ -52,14 +53,17 @@ section{margin:1.6rem 0}
 .badge{display:inline-block;padding:.15rem .6rem;border-radius:999px;
        font-size:.8rem;font-weight:600;margin-right:.4rem}
 .badge.Compliant{background:#ecfdf3;color:var(--ok)}
-.badge.Non-Compliant{background:#fef3f2;color:var(--bad)}
+.badge.Deviating{background:#fef3f2;color:var(--bad)}
+.badge.Incomplete{background:#fff7e6;color:var(--warn)}
+.badge.Ambiguous{background:#eef2ff;color:#3538cd}
 .badge.Cannot-Assess{background:#eaecf0;color:var(--muted)}
 .badge.confidence-High{background:#ecfdf3;color:var(--ok)}
 .badge.confidence-Medium{background:#fff7e6;color:var(--warn)}
 .badge.confidence-Low{background:#fef3f2;color:var(--bad)}
 .badge.review{background:#fef0c7;color:#7a2e0e}
 .badge.disputed{background:#fef3f2;color:var(--bad);border:1px solid var(--bad)}
-.badge.finding-type{background:#eef2ff;color:#3538cd}
+.badge.revised{background:#eef2ff;color:#3538cd;border:1px solid #3538cd}
+.badge.change-tag{background:#eef2ff;color:#3538cd}
 .badge-claim{background:#7a1f1f;color:#fff;border-radius:3px;padding:1px 6px;margin-left:6px;font-size:11px}
 .badge-sweep{background:#5b4a12;color:#fff;border-radius:3px;padding:1px 6px;margin-left:6px;font-size:11px}
 .interpretation{background:#f2f4f7;border-left:3px solid #3538cd;
@@ -69,12 +73,14 @@ section{margin:1.6rem 0}
        font-family:Consolas,monospace;font-size:.85rem;white-space:pre-wrap}
 .quote-label{font-size:.75rem;color:var(--muted);text-transform:uppercase;
              letter-spacing:.04em;margin-top:.5rem}
+.validation{background:#f8f9fc;border:1px solid #d0d5dd;border-left:4px solid #3538cd;
+            padding:.5rem .8rem;margin:.4rem 0;border-radius:4px}
 .rel-ok{color:var(--ok);font-weight:700}
 .rel-bad{color:var(--bad);font-weight:700}
 .rel-muted{color:var(--muted)}
 table{border-collapse:collapse;width:100%;margin:.4rem 0}
 td,th{border:1px solid #e4e7ec;padding:.3rem .6rem;font-size:.85rem;
-      text-align:left}
+      text-align:left;vertical-align:top}
 th{background:#f9fafb}
 .triage-table td,.triage-table th{padding:4px 8px;border-bottom:1px solid #333}
 .hidden{display:none}
@@ -119,7 +125,7 @@ document.querySelectorAll('.filter').forEach(function(b){
 });
 function exportFeedback(){
   var items = [];
-  document.querySelectorAll('.finding').forEach(function(f){
+  document.querySelectorAll('.finding, .rollup').forEach(function(f){
     var sel = f.querySelector('.fb');
     var c = f.querySelector('.fb-comment');
     if(sel && sel.value){
@@ -179,7 +185,6 @@ def _header_html(manifest):
     <tr><th>Company file</th><td>{esc(manifest.get('company_file'))}</td></tr>
     <tr><th>Company SHA-256</th><td><code>{esc(manifest.get('company_sha256'))}</code></td></tr>
     <tr><th>Run started</th><td>{esc(manifest.get('started'))}</td></tr>
-    <tr><th>Rule registry version</th><td>{esc(manifest.get('registry_version'))}</td></tr>
   </table>
   <h3>Component versions</h3>
   <table>{version_rows}</table>
@@ -237,22 +242,18 @@ def _dashboard_html(final):
         v = f.get("verdict") or "Unknown"
         verdict_counts[v] = verdict_counts.get(v, 0) + 1
 
-    tiles = "".join([
-        _tile("Compliant", verdict_counts.get("Compliant", 0)),
-        _tile("Non-Compliant", verdict_counts.get("Non-Compliant", 0)),
-        _tile("Cannot Assess", verdict_counts.get("Cannot Assess", 0)),
-        _tile("Ambiguous", company_cov.get(
-            "ambiguous", len(final.get("ambiguous", []) or []))),
-        _tile("Unmatched rows", company_cov.get(
+    tiles = "".join(
+        [_tile(v, verdict_counts.get(v, 0)) for v in _VERDICTS] +
+        [_tile("Unmatched rows", company_cov.get(
             "unmatched", len(final.get("unmatched_rows", []) or []))),
-        _tile("Unaddressed rules", official_cov.get(
-            "unaddressed", len(final.get("unaddressed_rules", []) or []))),
-    ])
+         _tile("Unresolved", company_cov.get("unresolved", 0)),
+         _tile("Unaddressed rules", official_cov.get(
+             "unaddressed", len(final.get("unaddressed_rules", []) or [])))])
 
     company_rows = list(company_cov.items())
     official_rows = []
     for k, v in official_cov.items():
-        if k == "duplicate_coverage_rule_ids":
+        if k == "multi_matched_row_ids":
             v = ", ".join(v) if v else "none"
         official_rows.append((k, v))
 
@@ -262,7 +263,7 @@ def _dashboard_html(final):
   <div class="tiles">{tiles}</div>
   <h3>Company row coverage</h3>
   <table>{_kv_rows(company_rows)}</table>
-  <h3>Official rule coverage</h3>
+  <h3>Official row coverage</h3>
   <table>{_kv_rows(official_rows)}</table>
 </section>
 """
@@ -312,40 +313,107 @@ def _filters_html():
 """
 
 
-def _score_table(candidates):
-    if not candidates:
-        return "<p>No candidate rules were scored.</p>"
+def _company_row_html(company):
+    """The COMPLETE company row: header/cells table, continuation rows,
+    narrative context, and the additive canonical-field aids."""
+    company = company or {}
+    headers = company.get("header_row", []) or []
+    cells = company.get("cells", []) or []
+    ncols = max(len(headers), len(cells))
+    head = "".join(f"<th>{esc(headers[i] if i < len(headers) else '')}</th>"
+                   for i in range(ncols))
+    body = "".join(f"<td>{esc(cells[i] if i < len(cells) else '')}</td>"
+                   for i in range(ncols))
+    rows = [f"<tr>{head}</tr>", f"<tr>{body}</tr>"]
+    for cont in company.get("continuation_cells", []) or []:
+        cont_cells = cont.get("cells", []) or []
+        body = "".join(
+            f"<td>{esc(cont_cells[i] if i < len(cont_cells) else '')}</td>"
+            for i in range(ncols))
+        rows.append(f"<tr>{body}</tr>")
+    table = f"<table>{''.join(rows)}</table>"
+    narrative = company.get("preceding_narrative", "")
+    narrative_html = (f'<p><b>Context:</b> {esc(narrative)}</p>'
+                      if narrative else "")
+    aids = company.get("canonical_fields", {}) or {}
+    aids_html = ""
+    if aids:
+        aids_html = (
+            "<details><summary>Canonical field aids</summary>"
+            f"<table>{_kv_rows(sorted(aids.items()))}</table></details>")
+    return (f"{narrative_html}{table}"
+            f"<p><b>Source:</b> {_source_ref_str(company.get('source_reference'))}"
+            f" &mdash; <b>Claim reading:</b> "
+            f"{esc(company.get('company_claim_reading'))}</p>{aids_html}")
+
+
+def _official_row_html(official):
+    """The COMPLETE official row: every column verbatim."""
+    official = official or {}
+    raw = official.get("raw_record", {}) or {}
+    rows = _kv_rows(raw.items()) or "<tr><td colspan=\"2\">none</td></tr>"
+    prov = official.get("provenance", {}) or {}
+    return (f"<table>{rows}</table>"
+            f"<p><b>Location:</b> {esc(prov.get('source_file'))} "
+            f"({esc(prov.get('locator'))})</p>")
+
+
+def _alignment_html(field_alignment):
+    if not field_alignment:
+        return ""
     rows = []
-    for c in candidates:
-        if not isinstance(c, dict):
+    for a in field_alignment:
+        if not isinstance(a, dict):
             continue
-        feats = c.get("features")
-        feat_str = ", ".join(f"{esc(k)}={esc(v)}" for k, v in feats.items()) \
-            if isinstance(feats, dict) else ""
-        rows.append(f"<tr><td>{esc(c.get('rule_id'))}</td>"
-                    f"<td>{esc(c.get('score'))}</td><td>{feat_str}</td></tr>")
-    return ("<table><tr><th>Candidate rule ID</th><th>Score</th>"
-            f"<th>Features (why matched)</th></tr>{''.join(rows)}</table>")
+        rel = a.get("relation")
+        cls = {"identical": "rel-ok", "equivalent": "rel-ok",
+               "differs": "rel-bad", "company-missing": "rel-bad",
+               "official-missing": "rel-muted"}.get(rel, "rel-muted")
+        rows.append(
+            f"<tr><td>{esc(a.get('company_ref'))}</td>"
+            f"<td class='quote'>{esc(a.get('company_quote'))}</td>"
+            f"<td>{esc(a.get('official_column'))}</td>"
+            f"<td class='quote'>{esc(a.get('official_quote'))}</td>"
+            f"<td><span class='{cls}'>{esc(rel)}</span></td></tr>")
+    return ("<h4>Field alignment</h4>"
+            "<table><tr><th>Company field</th><th>Company text</th>"
+            "<th>Official column</th><th>Official text</th>"
+            f"<th>Relation</th></tr>{''.join(rows)}</table>")
 
 
-def _observation_html(observation):
-    if not observation:
-        return "<p>No observation recorded.</p>"
-    parts = []
-    for k, v in observation.items():
-        if k in ("row_quote", "rule_quote") and v:
-            label = "Row quote" if k == "row_quote" else "Rule quote"
-            parts.append(f'<div class="quote-label">{esc(label)}</div>'
-                        f'<div class="quote">{esc(v)}</div>')
-        elif k == "relation":
-            cls = {"satisfies": "rel-ok",
-                  "violates": "rel-bad"}.get(v, "rel-muted")
-            parts.append(f'<div><b>Relation:</b> '
-                        f'<span class="{cls}">{esc(v)}</span></div>')
-        else:
-            parts.append(f"<div><b>{esc(str(k).replace('_', ' ').title())}:"
-                        f"</b> {esc(v)}</div>")
-    return "".join(parts)
+def _validation_html(validation):
+    if not validation:
+        return '<div class="validation">No validation recorded.</div>'
+    if "status" in validation:
+        return (f'<div class="validation"><b>Status:</b> '
+                f'{esc(validation["status"])}</div>')
+    parts = [f"<b>Outcome:</b> {esc(validation.get('outcome'))}",
+             f"<b>Independent verdict:</b> "
+             f"{esc(validation.get('independent_verdict'))}"]
+    if validation.get("revised_verdict"):
+        parts.append(f"<b>Revised verdict:</b> "
+                     f"{esc(validation.get('revised_verdict'))}")
+    if validation.get("reason"):
+        parts.append(f"<b>Reason:</b> {esc(validation.get('reason'))}")
+    body = "<br>".join(parts)
+    quote = validation.get("evidence_quote")
+    quote_html = (f'<div class="quote-label">Evidence quote</div>'
+                  f'<div class="quote">{esc(quote)}</div>' if quote else "")
+    return f'<div class="validation">{body}{quote_html}</div>'
+
+
+def _feedback_row_html():
+    fb_options = "".join(
+        f'<option value="{esc(o)}">{esc(o) if o else "(select)"}</option>'
+        for o in _FEEDBACK_OPTIONS)
+    return f"""
+  <div class="fb-row">
+    <label>Feedback:
+      <select class="fb">{fb_options}</select>
+    </label>
+    <input class="fb-comment" type="text" placeholder="Comment (optional)">
+  </div>
+"""
 
 
 def _finding_html(f):
@@ -353,107 +421,83 @@ def _finding_html(f):
     confidence = f.get("confidence") or "Unknown"
     review = bool(f.get("human_review_needed"))
     disputed = bool(f.get("disputed"))
-    finding_type = f.get("finding_type")
-    interpretation = f.get("interpretation")
-    interpretation_note = f.get("interpretation_note")
     company = f.get("company_row", {}) or {}
-    official = f.get("official_rule", {}) or {}
-    match = f.get("match", {}) or {}
-    skeptic = f.get("skeptic")
-    applied_rules = f.get("applied_rules", []) or []
-    display_id = f.get("record_id", f.get("row_id"))
+    official = f.get("official_row", {}) or {}
 
     badges = [
         f'<span class="badge {esc(_verdict_css(verdict))}">{esc(verdict)}</span>',
         f'<span class="badge confidence-{esc(confidence)}">'
         f'confidence: {esc(confidence)}</span>',
     ]
-    if finding_type:
-        # Surfaces the semantic classification (spec section 5) -- without
-        # this, the "wrong classification" feedback option has nothing on
-        # the card for a reviewer to judge as right or wrong.
+    if f.get("verdict_source") == "validation-revised":
         badges.append(
-            f'<span class="badge finding-type">type: {esc(finding_type)}</span>')
+            f'<span class="badge revised">REVISED by validation &mdash; '
+            f'first pass: {esc(f.get("first_pass_verdict"))}</span>')
+    for tag in f.get("change_analysis", []) or []:
+        badges.append(f'<span class="badge change-tag">{esc(tag)}</span>')
     if review:
         badges.append('<span class="badge review">HUMAN REVIEW NEEDED</span>')
     if disputed:
         badges.append(
-            '<span class="badge disputed">DISPUTED &mdash; skeptic refuted'
-            '</span>')
-    # Add claim badges
-    claim_badges = "".join(
-        f'<span class="badge-claim">{esc(fl)}</span>'
-        for fl in f.get("claim_flags", []))
+            '<span class="badge disputed">DISPUTED &mdash; validation '
+            'refuted</span>')
+    claim_badges = ""
+    if f.get("claim_reading") == "deviation":
+        claim_badges += '<span class="badge-claim">company-declared-deviation</span>'
+    if f.get("claim_consistency") == "contradicted":
+        claim_badges += '<span class="badge-claim">claim-contradicted</span>'
     sweep_badge = (
         '<span class="badge-sweep">sweep-originated</span>'
         if f.get("sweep_originated") else '')
 
-    if skeptic:
-        skeptic_html = (f"<p><b>Outcome:</b> {esc(skeptic.get('outcome'))}"
-                        f"<br><b>Reason:</b> {esc(skeptic.get('reason'))}</p>")
-    else:
-        skeptic_html = "<p>No skeptic review recorded.</p>"
+    reasons = f.get("review_reasons", []) or []
+    reasons_html = (f"<p><b>Review reasons:</b> "
+                    f"{', '.join(esc(r) for r in reasons)}</p>"
+                    if reasons else "")
 
-    applied_html = ", ".join(esc(r) for r in applied_rules) if applied_rules \
-        else "none"
+    note = f.get("company_row", {}).get("interpretation_note", "")
+    note_html = (f'<div class="interp"><b>Interpretation (not evidence):</b> '
+                 f'{esc(note)}</div>' if note else "")
+    record_notes = f.get("record_notes", "")
+    record_notes_html = (
+        f'<div class="interp"><b>Record notes:</b> {esc(record_notes)}</div>'
+        if record_notes else "")
 
-    interpretation_html = (
-        f'<h4>Interpretation</h4><div class="interpretation">'
-        f'{esc(interpretation)}</div>' if interpretation else "")
-
-    interpretation_note_html = (
-        f'<div class="interp"><b>Interpretation (not evidence):</b> '
-        f'{esc(interpretation_note)}</div>'
-        if interpretation_note else "")
-
-    fb_options = "".join(
-        f'<option value="{esc(o)}">{esc(o) if o else "(select)"}</option>'
-        for o in _FEEDBACK_OPTIONS)
-
-    # Build company claim row if present
-    company_claim_row = (
-        f"<table>{_kv_rows([('Company claim', f.get('company_compliance_claim'))])}</table>"
-        if f.get("company_compliance_claim") else "")
-
+    display_id = f.get("display_id") or f.get("official_row_id")
     return f"""
 <article class="finding" data-fid="{esc(f.get('finding_id'))}" data-verdict="{esc(verdict)}" data-confidence="{esc(confidence)}" data-review="{'true' if review else 'false'}">
   <div>{"".join(badges)}{claim_badges}{sweep_badge}</div>
   <p><b>Finding ID:</b> {esc(f.get('finding_id'))} &mdash;
-     <b>Row:</b> {esc(display_id)} &mdash;
-     <b>Rule:</b> {esc(f.get('rule_id'))} &mdash;
-     <b>Basis:</b> {esc(f.get('basis'))}</p>
+     <b>Row:</b> {esc(f.get('record_id'))} &mdash;
+     <b>Official row:</b> {esc(display_id)}</p>
   <div class="cols">
     <div>
-      <h4>Company submission</h4>
-      <div class="quote-label">Original text</div>
-      <div class="quote">{esc(company.get('original_company_text'))}</div>
-      <p><b>Source:</b> {_source_ref_str(company.get('source_reference'))}</p>
+      <h4>Company submission (complete row)</h4>
+      {_company_row_html(company)}
     </div>
     <div>
-      <h4>Official rule {esc(official.get('rule_id'))}</h4>
-      <p><b>Title:</b> {esc(official.get('title'))}</p>
-      <p><b>Check text:</b> {esc(official.get('check_text'))}</p>
-      <p><b>Expected value:</b> {esc(official.get('expected_value'))}</p>
+      <h4>Official row {esc(display_id)} (all columns)</h4>
+      {_official_row_html(official)}
     </div>
   </div>
-  <h4>Evidence</h4>
-  {_observation_html(f.get('observation'))}
-  {company_claim_row}
-  {interpretation_note_html}
-  {interpretation_html}
-  <h4>Match</h4>
-  <p><b>Tier:</b> {esc(match.get('tier'))}</p>
-  {_score_table(match.get('candidates'))}
-  <h4>Skeptic review</h4>
-  {skeptic_html}
-  <h4>Applied rules</h4>
-  <p>{applied_html}</p>
-  <div class="fb-row">
-    <label>Feedback:
-      <select class="fb">{fb_options}</select>
-    </label>
-    <input class="fb-comment" type="text" placeholder="Comment (optional)">
-  </div>
+  <h4>Evidence quotes</h4>
+  <div class="quote-label">Company row quote</div>
+  <div class="quote">{esc(f.get('row_quote'))}</div>
+  <div class="quote-label">Official row quote</div>
+  <div class="quote">{esc(f.get('official_quote'))}</div>
+  {_alignment_html(f.get('field_alignment'))}
+  <h4>Match rationale</h4>
+  <div class="interpretation">{esc(f.get('match_rationale'))}</div>
+  <h4>Semantic differences</h4>
+  <div class="interpretation">{esc(f.get('semantic_differences'))}</div>
+  <h4>Reasoning</h4>
+  <div class="interpretation">{esc(f.get('reasoning'))}</div>
+  {note_html}
+  {record_notes_html}
+  <h4>Validation</h4>
+  {_validation_html(f.get('validation'))}
+  {reasons_html}
+  {_feedback_row_html()}
 </article>
 """
 
@@ -466,6 +510,58 @@ def _findings_section_html(final):
 
 
 # --------------------------------------------------------------------------
+# rule rollups
+# --------------------------------------------------------------------------
+
+def _rollup_html(r):
+    verdict = r.get("verdict")
+    status = r.get("status")
+    review = bool(r.get("human_review_needed"))
+    badges = []
+    if verdict:
+        badges.append(
+            f'<span class="badge {esc(_verdict_css(verdict))}">joint: '
+            f'{esc(verdict)}</span>')
+        badges.append(
+            f'<span class="badge change-tag">'
+            f'{esc(r.get("coverage_of_requirement"))}</span>')
+    if status:
+        badges.append(f'<span class="badge Cannot-Assess">{esc(status)}</span>')
+    if review:
+        badges.append('<span class="badge review">HUMAN REVIEW NEEDED</span>')
+    contributors = ", ".join(esc(c) for c in
+                             r.get("contributing_record_ids", []) or [])
+    reasoning_html = (f'<div class="interpretation">{esc(r.get("reasoning"))}'
+                      f'</div>' if r.get("reasoning") else "")
+    reasons = r.get("review_reasons", []) or []
+    reasons_html = (f"<p><b>Review reasons:</b> "
+                    f"{', '.join(esc(x) for x in reasons)}</p>"
+                    if reasons else "")
+    return f"""
+<article class="rollup" data-fid="{esc(r.get('rollup_id'))}">
+  <div>{"".join(badges)}</div>
+  <p><b>Rollup:</b> {esc(r.get('rollup_id'))} &mdash;
+     <b>Official row:</b> {esc(r.get('display_id') or r.get('official_row_id'))}
+     &mdash; <b>Contributing rows:</b> {contributors}</p>
+  {reasoning_html}
+  <h4>Validation</h4>
+  {_validation_html(r.get('validation'))}
+  {reasons_html}
+  {_feedback_row_html()}
+</article>
+"""
+
+
+def _rollups_section_html(final):
+    rollups = final.get("rule_rollups", []) or []
+    if not rollups:
+        return ""
+    body = "".join(_rollup_html(r) for r in rollups)
+    return (f'<section id="rollups"><h2>Rule rollups '
+            f'(one official row, several company rows)</h2>{body}</section>')
+
+
+# --------------------------------------------------------------------------
 # leftovers -- ambiguous / unresolved always visible; bulk lists collapsible
 # --------------------------------------------------------------------------
 
@@ -475,15 +571,16 @@ def _ambiguous_html(final):
         return "<p>No ambiguous matches.</p>"
     cards = []
     for a in items:
-        ids = ", ".join(esc(r) for r in a.get("ambiguous_rule_ids", []) or [])
+        ids = ", ".join(esc(r) for r in
+                        a.get("ambiguous_official_row_ids", []) or [])
         cards.append(f"""
 <div class="leftover-card">
   <span class="badge review">HUMAN REVIEW NEEDED</span>
-  <p><b>Row:</b> {esc(a.get('record_id', a.get('row_id', '')))} &mdash;
+  <p><b>Row:</b> {esc(a.get('record_id', ''))} &mdash;
      <b>Source:</b> {_source_ref_str(a.get('source_reference'))}</p>
   <div class="quote">{esc(a.get('original_company_text'))}</div>
   <p><b>Ambiguous between:</b> {ids}</p>
-  {_score_table(a.get('candidates'))}
+  <p><b>Basis:</b> {esc(a.get('basis'))}</p>
 </div>
 """)
     return "".join(cards)
@@ -498,7 +595,7 @@ def _unresolved_html(final):
         cards.append(f"""
 <div class="leftover-card">
   <span class="badge review">HUMAN REVIEW NEEDED</span>
-  <p><b>Row:</b> {esc(r.get('record_id', r.get('row_id', '')))} &mdash;
+  <p><b>Row:</b> {esc(r.get('record_id', ''))} &mdash;
      <b>Status:</b> {esc(r.get('status'))} &mdash;
      <b>Source:</b> {_source_ref_str(r.get('source_reference'))}</p>
   <p><b>Notes:</b> {esc(r.get('notes'))}</p>
@@ -506,6 +603,19 @@ def _unresolved_html(final):
 </div>
 """)
     return "".join(cards)
+
+
+def _unresolved_pairs_html(final):
+    items = final.get("unresolved_pairs", []) or []
+    if not items:
+        return "<p>No unresolved pairs.</p>"
+    rows = "".join(
+        f"<tr><td>{esc(p.get('record_id'))}</td>"
+        f"<td>{esc(p.get('official_row_id'))}</td>"
+        f"<td>{esc(p.get('status'))}</td></tr>"
+        for p in items)
+    return ("<table><tr><th>Record</th><th>Official row</th><th>Status</th>"
+            f"</tr>{rows}</table>")
 
 
 def _unmatched_html(final):
@@ -517,10 +627,10 @@ def _unmatched_html(final):
         warns = ", ".join(esc(w) for w in r.get("warnings", []) or []) or "none"
         cards.append(f"""
 <div class="leftover-card">
-  <p><b>Row:</b> {esc(r.get('record_id', r.get('row_id', '')))} &mdash;
+  <p><b>Row:</b> {esc(r.get('record_id', ''))} &mdash;
      <b>Source:</b> {_source_ref_str(r.get('source_reference'))}</p>
   <div class="quote">{esc(r.get('original_company_text'))}</div>
-  <p><b>Warnings:</b> {warns}</p>
+  <p><b>Basis:</b> {esc(r.get('basis'))} &mdash; <b>Warnings:</b> {warns}</p>
 </div>
 """)
     return "".join(cards)
@@ -529,19 +639,21 @@ def _unmatched_html(final):
 def _unaddressed_html(final):
     items = final.get("unaddressed_rules", []) or []
     if not items:
-        return "<p>No unaddressed official rules.</p>"
-    rows = "".join(
-        f"<tr><td>{esc(r.get('rule_id'))}</td><td>{esc(r.get('title'))}</td>"
-        f"<td>{esc(r.get('check_text'))}</td>"
-        f"<td>{esc(r.get('expected_value'))}</td></tr>"
-        for r in items)
-    return ("<table><tr><th>Rule ID</th><th>Title</th><th>Check text</th>"
-           f"<th>Expected value</th></tr>{rows}</table>")
+        return "<p>No unaddressed official rows.</p>"
+    rows = []
+    for r in items:
+        raw = r.get("raw_record", {}) or {}
+        content = "; ".join(f"{k}: {v}" for k, v in raw.items())
+        prov = r.get("provenance", {}) or {}
+        rows.append(
+            f"<tr><td>{esc(r.get('display_id') or r.get('official_row_id'))}"
+            f"</td><td>{esc(prov.get('locator'))}</td>"
+            f"<td>{esc(content)}</td></tr>")
+    return ("<table><tr><th>ID</th><th>Location</th><th>Content "
+            f"(all columns)</th></tr>{''.join(rows)}</table>")
 
 
 def _leftovers_html(final):
-    coverage = final.get("coverage", {}) or {}
-    ignored_count = (coverage.get("company", {}) or {}).get("ignored_by_rule", 0)
     n_unmatched = len(final.get("unmatched_rows", []) or [])
     n_unaddressed = len(final.get("unaddressed_rules", []) or [])
     return f"""
@@ -551,8 +663,11 @@ def _leftovers_html(final):
   <h3>Ambiguous matches</h3>
   {_ambiguous_html(final)}
 
-  <h3>Unresolved rows (extraction-failed)</h3>
+  <h3>Unresolved rows</h3>
   {_unresolved_html(final)}
+
+  <h3>Unresolved pairs</h3>
+  {_unresolved_pairs_html(final)}
 
   <details>
     <summary>Unmatched company rows ({esc(n_unmatched)})</summary>
@@ -560,15 +675,8 @@ def _leftovers_html(final):
   </details>
 
   <details>
-    <summary>Unaddressed official rules ({esc(n_unaddressed)})</summary>
+    <summary>Unaddressed official rows ({esc(n_unaddressed)})</summary>
     {_unaddressed_html(final)}
-  </details>
-
-  <details>
-    <summary>Ignored content ({esc(ignored_count)})</summary>
-    <p>{esc(ignored_count)} company row(s) were excluded by an ignore-field
-       rule. Per-row detail for ignored rows is not persisted in this run's
-       artifacts.</p>
   </details>
 </section>
 """
@@ -614,6 +722,7 @@ def render(run_dir):
         + _dashboard_html(final)
         + _triage_html(final)
         + _findings_section_html(final)
+        + _rollups_section_html(final)
         + _leftovers_html(final)
         + _feedback_export_html()
     )

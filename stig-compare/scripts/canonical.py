@@ -1,51 +1,22 @@
-"""Canonical company record model (spec section 3) and mechanical helpers.
+"""Company record mechanics: shape, chunking, count reconciliation.
 
-All interpretation happens in Claude passes; this module only defines the
-target shape plus deterministic claim normalization, chunking, and count
-reconciliation. Claim synonyms are intentionally minimal — extensions come
-through the rules registry's equivalent-terminology category, never by
-editing this file per-submission.
+All interpretation happens in Claude passes; this module only builds the
+stored record shape. A record carries the COMPLETE verbatim row (cells,
+continuation cells, header row, narrative, provenance) — the canonical
+fields the interpretation pass extracts are an additive aid nested under
+`canonical_fields`, never a replacement for the raw row.
 """
-import re
-
 import common
-import normalize
+import schema
 
-CANONICAL_DATA_FIELDS = [
-    "stig_description", "stig_objective_or_requirement",
-    "stig_command_or_value", "company_approved_setting_or_expected_value",
-    "observed_value_or_evidence", "company_compliance_claim",
-    "company_severity", "remarks_or_justification"]
-
-MAPPING_TARGETS = set(CANONICAL_DATA_FIELDS) | {"extra_field", "ignore"}
-TABLE_CLASSIFICATIONS = {"stig_relevant", "irrelevant", "uncertain"}
-IRRELEVANT_REASONS = {"instructions", "general-info", "toc", "signoff",
-                      "other"}
-DISPOSITIONS = {"record", "separator", "continuation"}
-
-_NEGATED_COMPLIANCE = re.compile(
-    r"\b(?:non|not|no|never|cannot|can't|won't)[ -]*(?:be )?"
-    r"(?:comply|compliant|complies|compliance|adopt)")
-
-
-def normalize_claim(text):
-    norm = normalize.norm_text(text)
-    if not norm:
-        return "unknown"
-    if "deviat" in norm:
-        return "deviation"
-    if _NEGATED_COMPLIANCE.search(norm):
-        return "deviation"
-    if "comply" in norm or "compliant" in norm or "adopt" in norm:
-        return "comply"
-    return "unknown"
+CANONICAL_DATA_FIELDS = schema.CANONICAL_DATA_FIELDS
 
 
 def original_text(cells):
     return " | ".join(str(c) for c in cells)
 
 
-def chunk_rows(rows, size=40):
+def chunk_rows(rows, size=schema.INTERPRETATION_CHUNK_ROWS):
     """Chunks of <= size rows; a merged row never starts a chunk (it may be
     a continuation of the previous row and must stay in the same request)."""
     chunks, current = [], []
@@ -60,32 +31,39 @@ def chunk_rows(rows, size=40):
 
 
 def build_record(table, row, sub_index, fields, field_provenance,
-                 extra_fields, interpretation_note, context_grouping):
+                 interpretation_note, context_grouping, claim_reading):
     raw = original_text(row["cells"])
-    rec = {f: "" for f in CANONICAL_DATA_FIELDS}
-    for k, v in (fields or {}).items():
-        rec[k] = common.fold_ws(v)
-    rec["record_id"] = common.record_id(
-        table["table_index"], row["row_index"], sub_index, raw)
-    rec["row_id"] = common.row_id(table["table_index"], row["row_index"], raw)
-    rec["context_grouping"] = context_grouping or ""
-    rec["claim_normalized"] = normalize_claim(rec["company_compliance_claim"])
-    rec["extra_fields"] = dict(extra_fields or {})
-    rec["interpretation_note"] = interpretation_note or ""
-    rec["field_provenance"] = dict(field_provenance or {})
-    rec["source_reference"] = {
-        "table_index": table["table_index"], "row_index": row["row_index"],
-        "sub_index": sub_index,
-        "sheet_or_section": table["sheet_or_section"],
-        "table_title": context_grouping or ""}
-    rec["original_company_text"] = raw
-    rec["status"] = "ok"
-    rec["notes"] = ""
+    rec = {
+        "record_id": common.record_id(
+            table["table_index"], row["row_index"], sub_index, raw),
+        "row_id": common.row_id(table["table_index"], row["row_index"], raw),
+        "source_reference": {
+            "table_index": table["table_index"],
+            "row_index": row["row_index"],
+            "sub_index": sub_index,
+            "sheet_or_section": table["sheet_or_section"],
+            "table_title": context_grouping or ""},
+        "header_row": list(table.get("header_row", [])),
+        "cells": [str(c) for c in row["cells"]],
+        "continuation_cells": [],
+        "merged": bool(row.get("merged")),
+        "preceding_narrative": table.get("preceding_narrative", ""),
+        "context_grouping": context_grouping or "",
+        "canonical_fields": {k: common.fold_ws(v)
+                             for k, v in (fields or {}).items()
+                             if common.fold_ws(v or "")},
+        "field_provenance": dict(field_provenance or {}),
+        "interpretation_note": interpretation_note or "",
+        "company_claim_reading": claim_reading or "none",
+        "original_company_text": raw,
+        "status": "ok",
+        "notes": "",
+    }
     return rec
 
 
 def failed_record(table, row, note):
-    rec = build_record(table, row, 0, {}, {}, {}, "", "")
+    rec = build_record(table, row, 0, {}, {}, "", "", "none")
     rec["status"] = "extraction-failed"
     rec["notes"] = note
     return rec

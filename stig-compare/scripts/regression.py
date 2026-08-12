@@ -1,286 +1,129 @@
-"""Regression suite runner and rule-approval gate (spec sections 9-10).
+"""Advisory regression replay through the normal LLM comparison pass.
 
-`run_case`/`run_suite` replay ONLY the deterministic stages of the pipeline
-(candidate generation + deterministic value comparison) against a frozen
-case snapshot -- never the LLM matching/semantic/skeptic passes, so a suite
-run never talks to the network and never depends on Claude output.
+There is no deterministic replay and no approval gate any more: semantic
+decisions belong to the LLM, so the only honest way to re-check a past
+finding is to re-run the LLM comparison on the frozen inputs and DIFF the
+answer against the reviewer's feedback. Everything here is ADVISORY — it
+informs a human, it never gates or rewrites anything.
 
-`evaluate_candidate` is the approval gate a human maintainer consults before
-a candidate rule (drafted by feedback.py, see spec section 9) may become
-active: it never writes the registry itself, so the gate cannot be bypassed
-by simply calling the "evaluation" step. `approve_candidate` performs the
-write, and re-checks the gate itself (defense in depth) so it can never be
-called on a candidate that would regress the suite, even if a caller skips
-straight to it.
+Flow (driven by the skill agent, replay mode):
+1. build_replay(package_root, replay_dir) — freeze every replayable
+   comparison case into <replay_dir>/replay_requests.jsonl (same shape as
+   comparison_requests.jsonl, ids prefixed RPL-).
+2. The agent answers them exactly like a comparison pass, writing
+   <replay_dir>/replay_responses.jsonl.
+3. evaluate_replay(package_root, replay_dir) — mechanically validate each
+   response against the frozen payloads, then report agreement/disagreement
+   with the prior verdict alongside the reviewer's classification, verbatim.
 """
 import json
-import os
-import tempfile
-from datetime import datetime
 from pathlib import Path
 
-import candidates as candidates_mod
-import compare_values
-import rules as rules_mod
-
-_DETERMINISTIC_TIERS = ("T0", "T1")
-
-# Company-row fields a scoped rule (ignore-field, etc.) may target. Used only
-# to probe rules.applicable_rules() per field so field-level scopes are
-# honored in addition to sheet-or-section/document-type/global scopes.
-_ROW_FIELDS = ["stig_description", "stig_objective_or_requirement",
-               "stig_command_or_value",
-               "company_approved_setting_or_expected_value",
-               "observed_value_or_evidence", "context_grouping",
-               "original_company_text", "company_compliance_claim",
-               "company_severity", "remarks_or_justification"]
+import common
+import validate
 
 
-def _ignore_fields_for(company_row, registry):
-    """Field names to blank before replay, per active ignore-field rules
-    that apply to this row (spec section 10 scope precedence/conflicts)."""
-    source_ref = company_row.get("source_reference") or {}
-    doc_type = source_ref.get("document_type", "")
-    sheet = source_ref.get("sheet_or_section", "")
-
-    targets = set()
-    for field in _ROW_FIELDS:
-        context = {"document_type": doc_type, "sheet_or_section": sheet,
-                   "field": field}
-        applied, _ = rules_mod.applicable_rules(registry, context)
-        for r in applied:
-            if r["category"] == "ignore-field":
-                target = r.get("payload", {}).get("field")
-                if target:
-                    targets.add(target)
-    return targets
-
-
-def _replay_row(company_row, registry):
-    """A copy of company_row with any actively-ignored fields blanked."""
-    row = dict(company_row)
-    for field in _ignore_fields_for(company_row, registry):
-        if field in row:
-            row[field] = ""
-    return row
-
-
-def run_case(case, registry):
-    """Replay the deterministic stages of one regression case's snapshot
-    and evaluate it against `expected` (spec section 9/13-14).
-
-    Old regression case files (RC-*.json) predate the record_id/canonical-
-    record era and carry a company_row keyed only by row_id, with no
-    record_id or status field. The setdefaults below backfill both so those
-    old snapshots keep replaying unedited: candidates_mod.generate() now
-    requires row["record_id"] and skips rows whose status isn't "ok".
-    """
-    case_id = case["case_id"]
-    snapshot = case["snapshot"]
-    official_rules = snapshot["official_rules"]
-    expected = case.get("expected", {}) or {}
-
-    row = dict(snapshot["company_row"])
-    row.setdefault("record_id", row.get("row_id", "regression-row"))
-    row.setdefault("status", "ok")
-    row = _replay_row(row, registry)
-    rules_by_id = {r["rule_id"]: r for r in official_rules}
-
-    matches = candidates_mod.generate([row], official_rules)
-    match = matches[0] if matches else {"tier": None, "matched_rule_ids": []}
-    tier = match.get("tier")
-    matched = match.get("matched_rule_ids") or []
-    matched_rule_id = matched[0] if matched else None
-    deterministic_matched = tier in _DETERMINISTIC_TIERS and \
-        matched_rule_id is not None
-
-    verdict = None
-    if deterministic_matched:
-        rule = rules_by_id.get(matched_rule_id)
-        if rule is not None:
-            result = compare_values.deterministic_verdict(row, rule)
-            verdict = result["verdict"] if result is not None else None
-
-    if "not_matched_rule_id" in expected:
-        target = expected["not_matched_rule_id"]
-        still_matches = deterministic_matched and matched_rule_id == target
-        return {"case_id": case_id, "passed": not still_matches,
-                "advisory": False,
-                "detail": f"tier={tier} matched_rule_id={matched_rule_id}"}
-
-    if "not_verdict" in expected:
-        target = expected["not_verdict"]
-        if verdict is None:
-            return {"case_id": case_id, "passed": True, "advisory": True,
-                    "detail": "replay verdict is semantic (None)"}
-        return {"case_id": case_id, "passed": verdict != target,
-                "advisory": False, "detail": f"verdict={verdict}"}
-
-    if "verdict" in expected and "matched_rule_id" in expected:
-        target_verdict = expected["verdict"]
-        target_rule = expected["matched_rule_id"]
-        matched_ok = deterministic_matched and matched_rule_id == target_rule
-        if not matched_ok:
-            passed, advisory = False, False
-        elif verdict is None:
-            # match still holds, but the verdict itself is only decidable
-            # semantically now -- defer that aspect to agent review.
-            passed, advisory = True, True
-        else:
-            passed, advisory = (verdict == target_verdict), False
-        return {"case_id": case_id, "passed": passed, "advisory": advisory,
-                "detail": f"tier={tier} matched_rule_id={matched_rule_id} "
-                          f"verdict={verdict}"}
-
-    if expected.get("needs_human_review") or expected.get("note_only"):
-        return {"case_id": case_id, "passed": True, "advisory": True,
-                "detail": "agent-evaluated expectation"}
-
-    # No recognized deterministic expectation -- nothing to replay-check.
-    return {"case_id": case_id, "passed": True, "advisory": True,
-            "detail": "no deterministic expectation"}
-
-
-def run_suite(package_root, registry=None):
-    """Run every tests/regression/RC-*.json case against `registry`
-    (spec section 9). `registry=None` loads the active registry.json."""
-    package_root = Path(package_root)
-    if registry is None:
-        registry = rules_mod.load_registry(
-            package_root / "rules" / "registry.json")
-
-    regression_dir = package_root / "tests" / "regression"
-    case_files = sorted(regression_dir.glob("RC-*.json"))
-
-    total = passed = failed = advisory = 0
-    failures = []
-    for cf in case_files:
-        case_id = cf.stem                    # fallback if the file itself
-        #                                       can't even be parsed
+def _cases(package_root):
+    regression_dir = Path(package_root) / "tests" / "regression"
+    out = []
+    for cf in sorted(regression_dir.glob("RC-*.json")):
         try:
-            case = json.loads(cf.read_text(encoding="utf-8"))
-            case_id = case.get("case_id", case_id)
-            result = run_case(case, registry)
-        except Exception as exc:
-            # A single malformed/shape-mismatched regression case must never
-            # abort the whole suite (and therefore evaluate_candidate/
-            # approve_candidate) -- it counts as a hard failure instead, so
-            # the gate stays conservative (unreplayable = can't vouch for
-            # it) while every other case still runs. Detail carries only
-            # the exception's type name -- never document text or the
-            # exception's own message, which could echo file contents.
-            result = {"case_id": case_id, "passed": False, "advisory": False,
-                      "detail": f"unreplayable:{type(exc).__name__}"}
-        total += 1
-        if result["advisory"]:
-            advisory += 1
-        if result["passed"]:
-            passed += 1
-        else:
-            failed += 1
-            failures.append(result)
-
-    return {"total": total, "passed": passed, "failed": failed,
-            "advisory": advisory, "failures": failures}
+            out.append(json.loads(cf.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            out.append({"case_id": cf.stem, "unreadable": True})
+    return out
 
 
-def evaluate_candidate(package_root, candidate_path):
-    """The approval gate (spec section 10): never writes the registry."""
-    package_root = Path(package_root)
-    candidate_path = Path(candidate_path)
-    candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-    candidate_id = candidate["rule_id"]
+def build_replay(package_root, replay_dir):
+    """Freeze replayable cases into comparison-shaped requests. Rollup
+    cases are not replayable in isolation (a rollup depends on every
+    contributor's fresh comparison) and are listed as skipped."""
+    replay_dir = Path(replay_dir)
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    requests, skipped = [], []
+    for case in _cases(package_root):
+        cid = case.get("case_id", "unknown")
+        snap = case.get("snapshot") or {}
+        if case.get("unreadable") or case.get("kind") != "comparison" or \
+                not snap.get("company_row") or not snap.get("official_row"):
+            skipped.append(cid)
+            continue
+        requests.append({
+            "comparison_id": f"RPL-{cid}",
+            "case_id": cid,
+            "record_id": snap.get("record_id"),
+            "record": snap["company_row"],
+            "official_rows": [snap["official_row"]],
+            "match_basis": snap.get("match_basis", {}),
+            "sweep_origin_row_ids": [],
+            "precedents": [],
+            "instructions_file": "prompts/comparison.md",
+        })
+    common.write_jsonl(replay_dir / "replay_requests.jsonl", requests)
+    (replay_dir / "replay_manifest.json").write_text(
+        json.dumps({"requests": len(requests), "skipped": skipped},
+                   indent=1), encoding="utf-8")
+    return {"requests": len(requests), "skipped": skipped}
 
-    active_registry = rules_mod.load_registry(
-        package_root / "rules" / "registry.json")
-    baseline = run_suite(package_root, active_registry)
 
-    trial_candidate = dict(candidate)
-    trial_candidate["status"] = "active"
-    trial_registry = {
-        "registry_version": active_registry.get("registry_version"),
-        "rules": list(active_registry.get("rules", [])) + [trial_candidate]}
-    trial = run_suite(package_root, trial_registry)
+def evaluate_replay(package_root, replay_dir):
+    """Validate replay responses mechanically, then diff each fresh verdict
+    against the frozen one. Output is advisory prose data — no gate."""
+    replay_dir = Path(replay_dir)
+    req_by_id = {r["comparison_id"]: r for r in
+                 common.read_jsonl(replay_dir / "replay_requests.jsonl")}
+    cases_by_id = {c.get("case_id"): c for c in _cases(package_root)}
 
-    baseline_failed = {f["case_id"] for f in baseline["failures"]}
-    trial_failed = {f["case_id"] for f in trial["failures"]}
-    regressions = sorted(trial_failed - baseline_failed)
-    approvable = (regressions == [] and trial["failed"] == 0)
-
-    return {"candidate_id": candidate_id, "baseline": baseline,
-            "trial": trial, "regressions": regressions,
-            "approvable": approvable}
-
-
-def _atomic_write_json(path, data):
-    """Write `data` as JSON to `path` without ever leaving a half-written
-    or corrupted file if the process dies mid-write: write to a sibling
-    temp file first, then os.replace() -- an atomic rename on every
-    platform we run on (including Windows, unlike os.rename)."""
-    path = Path(path)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(data, indent=1))
-        os.replace(tmp_name, path)
-    except BaseException:
+    results, invalid = [], []
+    responses_path = replay_dir / "replay_responses.jsonl"
+    lines = []
+    if responses_path.exists():
+        lines = [l.strip() for l in
+                 responses_path.read_text(encoding="utf-8").splitlines()
+                 if l.strip()]
+    seen = set()
+    for raw in lines:
         try:
-            os.remove(tmp_name)
-        except OSError:
-            pass
-        raise
+            resp = json.loads(raw)
+        except json.JSONDecodeError:
+            invalid.append({"errors": ["malformed-json"]})
+            continue
+        if not isinstance(resp, dict):
+            invalid.append({"errors": ["malformed-json"]})
+            continue
+        cid = resp.get("comparison_id")
+        req = req_by_id.get(cid) if isinstance(cid, str) else None
+        if req is None or cid in seen:
+            invalid.append({"errors": ["no-such-request"], "id": cid})
+            continue
+        seen.add(cid)
+        row = req["official_rows"][0]
+        errs = validate.validate_comparison_output(
+            resp, req["record"], {row["official_row_id"]: row},
+            [row["official_row_id"]])
+        if errs:
+            invalid.append({"errors": errs, "id": cid})
+            continue
+        case = cases_by_id.get(req["case_id"], {})
+        snap = case.get("snapshot", {})
+        fresh = resp["per_rule"][0]
+        results.append({
+            "case_id": req["case_id"],
+            "prior_verdict": snap.get("verdict"),
+            "fresh_verdict": fresh["verdict"],
+            "agrees_with_prior": fresh["verdict"] == snap.get("verdict"),
+            "reviewer_classification": case.get("classification"),
+            "reviewer_comment": case.get("comment"),
+            "fresh_reasoning": fresh["reasoning"],
+        })
 
-
-def approve_candidate(package_root, candidate_path, approver):
-    """Moves an approvable candidate into registry.json as an active rule.
-
-    Raises RuntimeError if the gate says the candidate is not approvable --
-    this re-check happens even though a caller is expected to have already
-    consulted `evaluate_candidate`, so the gate cannot be skipped
-    programmatically (spec section 10, defense in depth).
-
-    Safe to retry: if a previous call already wrote the registry entry but
-    failed (or was never reached) before deleting the candidate file, a
-    retry with the same candidate file recognizes the rule_id is already in
-    the registry, skips re-appending/re-bumping the version, and just
-    finishes the cleanup (deletes the stale candidate file). Without this
-    guard a retry would append a second entry with the same rule_id, which
-    rules.load_registry() rejects forever after -- bricking every future
-    registry load.
-    """
-    package_root = Path(package_root)
-    candidate_path = Path(candidate_path)
-
-    verdict = evaluate_candidate(package_root, candidate_path)
-    if not verdict["approvable"]:
-        raise RuntimeError(
-            f"candidate not approvable: {verdict['candidate_id']} "
-            f"regressions={len(verdict['regressions'])} "
-            f"trial_failed={verdict['trial']['failed']}")
-
-    candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
-    rule_id = candidate["rule_id"]
-
-    registry_path = package_root / "rules" / "registry.json"
-    registry = rules_mod.load_registry(registry_path)
-    existing_ids = {r.get("rule_id") for r in registry.get("rules", [])}
-    already_approved = rule_id in existing_ids
-
-    if not already_approved:
-        candidate["status"] = "active"
-        provenance = dict(candidate.get("provenance") or {})
-        provenance["approved_by"] = approver
-        provenance["approved"] = datetime.now().isoformat(timespec="seconds")
-        candidate["provenance"] = provenance
-
-        registry.setdefault("rules", []).append(candidate)
-        registry["registry_version"] = registry.get("registry_version", 0) + 1
-        _atomic_write_json(registry_path, registry)
-
-    if candidate_path.exists():
-        candidate_path.unlink()
-
-    return {"candidate_id": rule_id, "approved_by": approver,
-            "registry_version": registry["registry_version"],
-            "already_approved": already_approved}
+    unanswered = sorted(set(req_by_id) - seen)
+    report = {"advisory": True,
+              "total_requests": len(req_by_id),
+              "answered": len(results),
+              "invalid": invalid,
+              "unanswered": unanswered,
+              "results": results}
+    (replay_dir / "replay_report.json").write_text(
+        json.dumps(report, indent=1), encoding="utf-8")
+    return report

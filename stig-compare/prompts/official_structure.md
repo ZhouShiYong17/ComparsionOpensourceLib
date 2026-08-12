@@ -1,58 +1,85 @@
-# Official Structure Prompt (annotate the official file's columns)
+# Brief: official structuring — column annotation and verbatim index
 
-STRICT RULES — apply to every response:
-- Use ONLY the evidence supplied in the request. No outside knowledge.
-- Never invent, infer, or complete missing information.
-- Never force a match or a verdict you are not certain of. "none",
-  "ambiguous", and "cannot-determine" are always acceptable answers.
-- Every quote you return must be copied VERBATIM from the supplied text.
-  Quotes are checked mechanically; an altered quote invalidates the response.
-- Distinguish observation (what the texts say) from interpretation
-  (what you conclude). Put conclusions only in the fields meant for them.
-- When the request carries `retry: true`, echo `"retry": true` in your
-  response — a response missing a required echo is rejected mechanically.
-- Output MUST be a single JSON object matching the schema below exactly.
+You are a subagent in the stig-compare skill. Your dispatch block names the run
+directory, the mode (A or B), and the exact lines of
+`runs/<ts>/official_rows.jsonl` that are yours. Each line of that file is one
+official STIG row: `{"official_row_id", "sheet_or_section", "row_number",
+"headers", "cells", "provenance"}` — cells are verbatim and ATOMIC (a comma or
+newline inside a cell is content, never a boundary).
 
-## Input
+## Strict rules
+- Use ONLY what you read from the files named in your dispatch. No outside
+  knowledge of STIGs, products, or "usual" column layouts. Never invent, infer,
+  or complete missing text.
+- Quotes and index text must be VERBATIM — character-for-character copies of
+  the JSON-decoded cell content. Paraphrase, summary, and truncation are
+  forbidden in Mode B.
+- `null` / `other` are normal answers and beat a guess.
+- Write shards with the Write tool, compact JSON, one object per line, exact
+  field names and enum spellings below.
+- Your final message must be ONLY compact JSON:
+  `{"unit_id": "...", "status": "ok"|"failed", "counts": {...}}` plus
+  `"errors": [...]` when failed. No prose, no row content.
 
-One record from `official_structure_requests.jsonl`:
+## Mode A — structure annotation (one unit per sheet/section)
 
-- `structure_id` (string) — echo back unchanged.
-- `sheet_or_section` (string) — which sheet/section of the official file
-  this request covers.
-- `headers` (array of strings) — the full header row, verbatim.
-- `sample_rows` (array of arrays) — up to the first 15 data rows, all
-  columns verbatim.
-- `row_count` (int) — total data rows in this sheet/section.
-- On a retry: `retry: true` and `previous_errors`.
+Read the first ~15 data lines of your sheet's range (plus the `headers` array)
+and decide what each column IS. This is ANNOTATION ONLY — nothing you answer
+here drops, filters, or reduces any official row; every row travels onward
+complete regardless.
 
-## Output schema
+Write `runs/<ts>/structure/<sheet-slug>.json` — a single line:
 
-```json
-{
-  "structure_id": "OS-0",
-  "display_id_column": "Rule ID",
-  "column_roles": {"Rule ID": "id", "Title": "title", "Notes": "other"},
-  "notes": ""
-}
+```
+{"sheet_or_section": "...",
+ "display_id_column": "<verbatim header>" | null,
+ "column_roles": {"<verbatim header or col<i>>": "id|title|severity|check|fix|expected|other", ...},
+ "notes": ""}
 ```
 
-## Decision guide
+- `display_id_column`: the verbatim header of the column holding the
+  human-facing rule identifier (V-number, SV-number, STIG ID, Rule ID). Use
+  `null` when no column is clearly an identifier — null beats a guess.
+- `column_roles`: EVERY header gets exactly one role. `other` is a normal
+  answer. `title` = short rule name; `check`/`fix` = procedure text;
+  `expected` = required value/setting.
+- `notes` is the only free-text field (`""` when nothing to say).
+- Counts: `{"columns": N}`.
 
-- This pass is ANNOTATION ONLY. Nothing you answer here drops, filters, or
-  reduces any official row — every column of every row travels to matching
-  and comparison verbatim regardless. Your annotations help the report and
-  later passes label columns.
-- `display_id_column`: the header of the column that holds the official
-  rule's human-facing identifier (e.g. a V-number or STIG ID column). It
-  must be copied verbatim from `headers`. Use `null` when no column is
-  clearly an identifier — `null` is always acceptable and preferred over a
-  guess.
-- `column_roles`: assign EVERY header in `headers` exactly one role from:
-  `id`, `title`, `severity`, `check`, `fix`, `expected`, `other`. When a
-  column does not clearly fit a specific role, use `other` — that is a
-  normal answer, not a failure.
-- `notes` is the only free-text field: anything a human should know about
-  this sheet's structure (e.g. "two header-like rows"). Use `""` when
-  there is nothing to note.
-- Include every key in every response.
+## Mode B — verbatim index (one unit per ≤40-row chunk)
+
+Your dispatch supplies the sheet's Mode-A structure shard content and your
+chunk's line range. For each row in the range, write one index line copying the
+identity-bearing text VERBATIM.
+
+Write `runs/<ts>/index/<sheet-slug>-r<first_row_number>.jsonl` — one line per
+row:
+
+```
+{"official_row_id": "...", "display_id": "<verbatim cell>" | null,
+ "title": "<verbatim cell(s)>", "requirement": "<verbatim cell(s)>"}
+```
+
+- `display_id` comes from the Mode-A `display_id_column` (null when that is
+  null or the cell is empty).
+- `title` = the full verbatim content of the `title`-role column.
+- `requirement` = the full verbatim content of the column(s) that state WHAT is
+  required — the requirement / objective / discussion / `expected`-role
+  column(s) — joined with a single `\n`, each cell intact.
+- **Exclude step-by-step verification and remediation procedures** (`check`,
+  `fix`) from the index. They are the bulk of an official STIG's bytes and they
+  describe HOW to verify, not what is required; every one of them is still read
+  in full later, when complete rows are adjudicated and compared. Including
+  them here can triple or quadruple the index that every scoping agent must
+  read, which costs recall as much as tokens.
+- Fall back to the check/fix text ONLY when no other column states the
+  requirement — a rule whose entire substance lives in its check procedure must
+  still be findable.
+- NEVER paraphrase, summarize, or truncate what you do include: the index
+  compacts by DROPPING procedure columns, never by rewriting. A detail lost to
+  a rewrite causes a silent mismatch no later pass can recover.
+- If Mode A found no `title` and no requirement-bearing column at all, copy ALL
+  cells verbatim into `requirement` (cells only, `\n`-joined — do not emit
+  `header: cell` pairs).
+- Every row in your range gets exactly one line — no skips, no additions.
+- Counts: `{"rows_indexed": N}`.

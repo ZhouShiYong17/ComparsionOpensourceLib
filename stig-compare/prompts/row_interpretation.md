@@ -1,89 +1,96 @@
-# Row Interpretation Prompt (Phase 2: additive row annotation)
+# Brief: row interpretation — build the Proposed Structure
 
-STRICT RULES — apply to every response:
-- Use ONLY the evidence supplied in the request. No outside knowledge.
-- Never invent, infer, or complete missing information.
-- Never force a match or a verdict you are not certain of. "none",
-  "ambiguous", and "cannot-determine" are always acceptable answers.
-- Every quote you return must be copied VERBATIM from the supplied text.
-  Quotes are checked mechanically; an altered quote invalidates the response.
-- Distinguish observation (what the texts say) from interpretation
-  (what you conclude). Put conclusions only in the fields meant for them.
-- When the request carries `retry: true`, echo `"retry": true` in your
-  response — a response missing a required echo is rejected mechanically.
-- Output MUST be a single JSON object matching the schema below exactly.
+You are a subagent in the stig-compare skill. You build part of the **Proposed
+Structure**: the normalized view of the company submission that every later
+pass (matching, comparison, validation, reporting) reads instead of the
+original document.
 
-## Input
+**What the Proposed Structure is for.** It exists to help later agents REASON —
+it is NOT a replacement source of truth, and normalizing must never cost
+information. That is why each record you write carries the COMPLETE verbatim
+row *alongside* the interpreted fields: the cells, any continuation cells, the
+header row, the narrative above the table, and the provenance needed to trace
+any value back to the exact file, sheet, row, and cell it came from. A field
+you cannot fill is simply absent — the evidence is still there in the record,
+and a later agent can read what you could not classify. Submissions differ in
+shape every time; the structure adapts to the document, never the reverse.
 
-One record from `interpretation_requests.jsonl`:
+Your dispatch names the run directory, ONE table's triage shard
+(`runs/<ts>/triage/t<i>.json` — read it), and a chunk of ≤40 of that table's
+rows to read from `runs/<ts>/submission_dump.json` (or a raw-file range).
+Cells are ATOMIC — commas/newlines inside a cell are content; in raw CSV a
+quoted field is ONE cell.
 
-- `chunk_id` (string) — echo back unchanged.
-- `table_index` (int), `context_grouping` (string), `header_row` (array),
-  `preceding_narrative` (string).
-- `column_mapping` (object) — the approved Phase-1 annotation: column index
-  (string) -> canonical field | "other". A hint, not a gate.
-- `rows` (array) — this chunk's rows: `{"row_index": int, "cells": [...],
-  "merged": bool}`.
-- On a retry: `retry: true` and `previous_errors`.
+## Strict rules
+- Use ONLY what you read from the named files. Never invent, infer, or
+  complete. Copy cells verbatim; NEVER merge two cells' text into one field
+  value — every extracted value must be a verbatim substring of a SINGLE cell.
+- Everything you extract is an ADDITIVE aid: the complete verbatim row travels
+  onward inside the record regardless, so a sparse `fields` object is normal
+  and correct when the table is messy.
+- **Silence is `none`, not `comply`** — never read compliance into a row that
+  doesn't state it.
+- `interpretation_note` is your ONLY free-text field; it is display-only and
+  never treated as evidence. `""` when nothing to say.
+- Write shards with the Write tool, compact JSON, exact field names and enum
+  spellings below.
+- Final message: ONLY `{"unit_id": "...", "status": "ok"|"failed",
+  "counts": {...}}` (+ `"errors"` when failed). No prose, no cell content.
 
-## Output schema
+## Task
 
-```json
-{
-  "chunk_id": "T3-C0",
-  "rows": [
-    {"row_index": 1, "disposition": "record",
-     "records": [
-       {"sub_index": 0,
-        "fields": {"stig_objective_or_requirement": "..."},
-        "field_provenance": {"stig_objective_or_requirement":
-                              {"row_index": 1, "cell_index": 0}},
-        "company_claim_reading": "comply | deviation | unclear | none",
-        "interpretation_note": ""}]},
-    {"row_index": 2, "disposition": "separator", "separator_text": "..."}
-  ]
-}
+Account for EVERY row in your chunk exactly once — a skipped or doubled
+`row_index` invalidates the unit. Each row gets one disposition:
+
+- `record` — the row makes one or more claims/statements worth comparing.
+- `separator` — a heading, blank spacer, or section divider carrying no claim.
+- `continuation` — the row only continues the PREVIOUS row's content (merged
+  or wrapped cells). It emits no record of its own; attach its cells to the
+  previous record's `continuation_cells` and cite it in `field_provenance`
+  where used.
+
+**Merged cells look like duplication.** When a Word/Excel cell spans several
+columns, the dump repeats that cell's text at every position it covers, and the
+row is flagged `"merged": true`. Identical adjacent cells in a merged row are
+ONE source cell seen twice — never read them as two separate values, and never
+split one record into two because of them. Quote such text once, and point
+`field_provenance` at the first position it occupies.
+
+Write TWO shards:
+
+1. `runs/<ts>/accounting/t<i>-r<first_row_index>.jsonl` — one line per row:
+
+```
+{"table_index": N, "row_index": N,
+ "disposition": "record" | "separator" | "continuation",
+ "separator_text": "<verbatim>" | null}
 ```
 
-## Decision guide
+2. `runs/<ts>/proposed/t<i>-r<first_row_index>.jsonl` — one line per RECORD
+   (a single row that covers several distinct settings may yield several
+   records with `-s0`, `-s1`, … suffixes; each value still a verbatim
+   substring of a single cell):
 
-- Everything you extract here is an ADDITIVE aid: the complete verbatim row
-  (all cells, continuation cells, headers, narrative) travels to matching,
-  comparison, and validation regardless of what you put in `fields`. A
-  sparse `fields` object is a normal answer — extract only what is clearly
-  present.
-- Account for EVERY row in the request's `rows`, exactly once, using
-  `disposition`:
-  - `"record"` — a data row. Produce 1..n records (see splitting below).
-  - `"separator"` — a sub-heading, section divider, or blank row inside
-    the table. If it carries text, copy it verbatim into
-    `separator_text`; it refines the grouping context for rows below it.
-  - `"continuation"` — a merged/overflow row whose cells belong to the
-    previous data row. Do NOT emit records for it; instead, the previous
-    row's records may cite its cells in `field_provenance` (with that
-    continuation row's `row_index`).
-  A missing or duplicated `row_index` invalidates the whole response.
-- Default behavior for a `record` row: for each column mapped to a
-  canonical field, copy that cell's text VERBATIM into `fields` and record
-  `{"row_index", "cell_index"}` in `field_provenance`. Skip empty cells
-  and `other` columns (their cells still travel with the full row).
-- Deviate from the column mapping ONLY when the row itself demands it
-  (e.g. a value sitting in the wrong column) — provenance must still point
-  at the actual cell the text came from, and the text must remain
-  verbatim. Never merge text from two cells into one field.
-- Splitting: when one row genuinely covers several distinct settings,
-  emit several records with `sub_index` 0, 1, ... — each field value still
-  a verbatim substring of a single cell of this row (or its continuation
-  rows).
-- `company_claim_reading`: what THIS row's own text states about the
-  company's compliance stance. `comply` when the row states the company
-  complies/adopts the requirement; `deviation` when it declares a
-  deviation or non-adoption; `unclear` when the row addresses its stance
-  but you cannot tell which; `none` when the row states no stance at all.
-  NEVER infer a stance the row does not state — silence is `none`, not
-  `comply`.
-- `interpretation_note` is the ONLY free-text field: use it to note what a
-  human reviewer should know (e.g. "the DEVIATION entry appears to apply
-  only to the second setting"). It is display-only and never used as
-  matching evidence. Use `""` when there is nothing to note.
-- Include every key shown in the schema for each entry you emit.
+```
+{"record_id": "CR-t<i>-r<row_index>[-s<k>]",
+ "table_index": N, "row_index": N,
+ "header_row": [...], "cells": [...],
+ "continuation_cells": [[...], ...],
+ "merged": true|false,
+ "preceding_narrative": "<verbatim>", "context_grouping": "<verbatim>" | "",
+ "fields": {"<canonical field>": "<verbatim substring of one cell>", ...},
+ "field_provenance": {"<canonical field>": {"row_index": N, "cell_index": N}, ...},
+ "company_claim_reading": "comply" | "deviation" | "unclear" | "none",
+ "interpretation_note": ""}
+```
+
+- `header_row`, `cells`, `continuation_cells`, `preceding_narrative` are
+  copied verbatim from the dump — the record must be self-contained: a later
+  agent reading only this line sees the COMPLETE row.
+- `fields` uses the triage `column_mapping` as the default reading; deviate
+  only when the actual row demands it, and `field_provenance` must point at
+  the real cell either way.
+- `company_claim_reading` is what THIS row's own text states about compliance
+  (`comply` / `deviation` / explicitly unclear / says nothing = `none`).
+- Counts: `{"rows": N, "records": N, "separators": N, "continuations": N}` —
+  rows must equal your chunk size.

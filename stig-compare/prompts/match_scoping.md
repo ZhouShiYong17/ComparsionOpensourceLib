@@ -1,61 +1,45 @@
-# Match Scoping Prompt (nominate candidate official rows)
+# Brief: match scoping — nominate candidate pairs (recall pass)
 
-STRICT RULES — apply to every response:
-- Use ONLY the evidence supplied in the request. No outside knowledge.
-- Never invent, infer, or complete missing information.
-- Never force a match or a verdict you are not certain of. "none",
-  "ambiguous", and "cannot-determine" are always acceptable answers.
-- Every quote you return must be copied VERBATIM from the supplied text.
-  Quotes are checked mechanically; an altered quote invalidates the response.
-- Distinguish observation (what the texts say) from interpretation
-  (what you conclude). Put conclusions only in the fields meant for them.
-- When the request carries `retry: true`, echo `"retry": true` in your
-  response — a response missing a required echo is rejected mechanically.
-- Output MUST be a single JSON object matching the schema below exactly.
+You are a subagent in the stig-compare skill. Your dispatch names the run
+directory, a batch of ~8 record lines to Read from `runs/<ts>/proposed.jsonl`
+(by line numbers), and the index file `runs/<ts>/index.jsonl` (Read it in
+full — it carries every official row's verbatim display_id, title, and
+requirement text).
 
-## Input
+## Strict rules
+- Use ONLY what you read from the named files. Never invent ids — every
+  `record_id` and `official_row_id` you emit must exist in the files you read.
+- You are NOT deciding matches. Adjudication (a later, binding pass) sees the
+  COMPLETE rows for every pair you nominate and filters freely. **A missed
+  nomination is unrecoverable; an over-generous one is filtered later —
+  prefer recall over precision.**
+- Read the WHOLE record (all cells, continuation cells, narrative) and the
+  WHOLE index entry — not just titles.
+- Never nominate on severity alone or on a shared generic topic word alone
+  ("password", "audit") — there must be a plausible substantive connection.
+- Unbounded cardinality both ways: one record may nominate many official rows
+  and vice versa. An EMPTY nomination list for a record is an acceptable,
+  meaningful answer — it means you saw the whole index and found nothing
+  plausible.
+- Write your shard with the Write tool, compact JSON lines, exact field names
+  below.
+- Final message: ONLY `{"unit_id": "...", "status": "ok"|"failed",
+  "counts": {...}}` (+ `"errors"` when failed). No prose.
 
-One record from `scoping_requests.jsonl`:
+## Task
 
-- `scoping_id` (string) — echo back unchanged.
-- `records` (array) — a batch of COMPLETE company records: verbatim cells,
-  continuation cells, header row, surrounding narrative, provenance, and
-  the additive canonical-field aids.
-- `official_rows` (array) — one slice of the official corpus, each row
-  COMPLETE: all columns verbatim (`headers`/`cells`/`raw_record`),
-  sheet/section, row number, provenance. Other slices of the corpus are
-  handled by separate requests — you only judge this slice.
-- On a retry: `retry: true` and `previous_errors`.
+For each record in your batch, ask: **"Given everything stated in this
+company row — description, settings, evidence, remarks, narrative context —
+which official requirements COULD it plausibly be addressing?"**
 
-## Output schema
+Write `runs/<ts>/nominations/b<batch_number>.jsonl` — one line per nomination:
 
-```json
-{
-  "scoping_id": "SC-T3B0-K1",
-  "nominations": [
-    {"record_id": "CR-1a2b3c4d", "official_row_id": "OR-9f8e7d6c",
-     "note": "same password-reuse parameter"}
-  ]
-}
+```
+{"record_id": "...", "official_row_id": "...", "note": "<short display-only phrase>"}
 ```
 
-## Decision guide
+Records with zero nominations still need visibility: append one line
+`{"record_id": "...", "official_row_id": null, "note": "no-candidates"}` for
+each, so downstream accounting sees the record was scoped.
 
-- For EACH record in `records`, nominate EVERY official row in this
-  request's `official_rows` that might plausibly address the same
-  requirement. You are NOT deciding matches here — a separate adjudication
-  pass examines every nomination with full evidence and makes the binding
-  decision. A missed nomination is unrecoverable; an over-generous one is
-  filtered later. Prefer recall over precision.
-- Read the WHOLE record — every cell, continuation cells, the narrative
-  and grouping context — and the WHOLE official row, not just titles.
-- Never nominate on severity alone or on a shared generic topic word
-  alone; there must be a plausible substantive connection (same setting,
-  parameter, command, control objective, or requirement subject).
-- The number of nominations is unbounded: a record may nominate many rows,
-  a row may be nominated by many records, and a record with no plausible
-  row in this slice simply appears in no nominations. An empty
-  `nominations` array is an acceptable answer for the whole request.
-- `note` is a short phrase naming the connection; it is display-only.
-- `record_id` / `official_row_id` values must come from THIS request.
-- Include both keys in every response.
+Counts: `{"records": N, "nominations": N, "no_candidates": N}`.

@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stig-compare report — <!--TITLE--></title>
+<style>
+:root{
+  --bg:#f7f8fa; --panel:#ffffff; --ink:#1b2733; --muted:#5b6b7b; --line:#dde3ea;
+  --ok:#1a7f4b; --bad:#b3261e; --warn:#8a6d00; --info:#2a5db0; --dim:#6b7280;
+  --chip:#eef1f5;
+}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 "Segoe UI",system-ui,sans-serif;color:var(--ink);background:var(--bg);padding:0 0 4rem}
+header.page{background:var(--panel);border-bottom:1px solid var(--line);padding:1.2rem 2rem}
+header.page h1{margin:0 0 .3rem;font-size:1.3rem}
+header.page .meta{color:var(--muted);font-size:.85rem;white-space:pre-wrap}
+main{max-width:1200px;margin:0 auto;padding:0 2rem}
+section.block{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:1.2rem 0;padding:1rem 1.2rem}
+section.block>h2{margin:.1rem 0 .8rem;font-size:1.05rem}
+.warnings .warn-item{border-left:4px solid var(--warn);background:#fff8e1;padding:.5rem .8rem;margin:.4rem 0;border-radius:0 6px 6px 0}
+.warnings .red-banner{border-left:6px solid var(--bad);background:#fdecea;font-weight:600;padding:.7rem .9rem;margin:.4rem 0;border-radius:0 6px 6px 0}
+.tiles{display:flex;flex-wrap:wrap;gap:.6rem;margin-bottom:.9rem}
+.tile{flex:1 1 120px;min-width:120px;background:var(--chip);border-radius:8px;padding:.6rem .8rem;text-align:center}
+.tile b{display:block;font-size:1.4rem}
+.tile span{color:var(--muted);font-size:.78rem}
+table{border-collapse:collapse;width:100%;margin:.4rem 0}
+th,td{border:1px solid var(--line);padding:.35rem .55rem;text-align:left;vertical-align:top;font-size:.85rem}
+th{background:var(--chip)}
+.wrap{overflow-x:auto}
+article.finding,article.rollup{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:1rem 0;padding:1rem 1.2rem}
+article[hidden]{display:none}
+.badges{display:flex;flex-wrap:wrap;gap:.35rem;margin-bottom:.5rem}
+.badge{background:var(--chip);border-radius:999px;padding:.12rem .6rem;font-size:.75rem;font-weight:600;color:var(--muted)}
+.badge.v-Compliant{background:#e3f4ea;color:var(--ok)}
+.badge.v-Deviating{background:#fdecea;color:var(--bad)}
+.badge.v-Incomplete,.badge.v-Ambiguous{background:#fff8e1;color:var(--warn)}
+.badge.v-CannotAssess{background:#eceff3;color:var(--dim)}
+.badge.review,.badge.disputed{background:#fdecea;color:var(--bad);border:1px solid var(--bad)}
+.badge.revised{background:#e8f0fe;color:var(--info)}
+.ids{color:var(--muted);font-size:.78rem;margin-bottom:.6rem}
+.evidence.two-col{display:grid;grid-template-columns:1fr 1fr;gap:.8rem}
+.evidence .company,.evidence .official{border:1px solid var(--line);border-radius:6px;padding:.6rem .8rem;font-size:.83rem;overflow-x:auto}
+.evidence h4{margin:.1rem 0 .4rem;font-size:.8rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.evidence pre{margin:0;white-space:pre-wrap;word-break:break-word;font:inherit}
+blockquote.hl-company,blockquote.hl-official{margin:.6rem 0;padding:.45rem .8rem;border-left:4px solid var(--info);background:var(--chip);font-size:.85rem;white-space:pre-wrap}
+blockquote.hl-official{border-left-color:var(--ok)}
+section.rationale,section.note,section.validation{border-top:1px dashed var(--line);margin-top:.7rem;padding-top:.6rem;font-size:.87rem}
+section.note{color:var(--muted)}
+section.validation .vo-upheld{color:var(--ok)} section.validation .vo-refuted{color:var(--bad)}
+section.validation .vo-revised{color:var(--info)} section.validation .vo-needs-human{color:var(--warn)}
+.fb{display:flex;gap:.5rem;border-top:1px solid var(--line);margin-top:.8rem;padding-top:.7rem}
+.fb select,.fb input{font:inherit;padding:.25rem .4rem;border:1px solid var(--line);border-radius:6px}
+.fb input{flex:1}
+.filters{display:flex;flex-wrap:wrap;gap:.4rem;margin:.2rem 0 .8rem}
+.filters button{font:inherit;font-size:.78rem;padding:.2rem .7rem;border:1px solid var(--line);border-radius:999px;background:var(--panel);cursor:pointer}
+.filters button.off{opacity:.35}
+#exportBtn{position:fixed;right:1.4rem;bottom:1.4rem;font:inherit;font-weight:600;padding:.6rem 1.1rem;border:none;border-radius:999px;background:var(--info);color:#fff;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25)}
+@media (max-width:800px){.evidence.two-col{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header class="page">
+  <h1>stig-compare report</h1>
+  <div class="meta"><!--META--></div>
+</header>
+<main>
+  <section class="block warnings"><h2>Warnings</h2><!--WARNINGS--></section>
+  <section class="block dashboard"><h2>Dashboard</h2><!--DASHBOARD--></section>
+  <section class="block triage"><h2>Table triage</h2><div class="wrap"><!--TRIAGE--></div></section>
+  <section class="block findings-block"><h2>Findings</h2>
+    <div class="filters" id="filters"></div>
+    <!--FINDINGS-->
+  </section>
+  <section class="block rollups-block"><h2>Rule rollups</h2><!--ROLLUPS--></section>
+  <section class="block leftovers"><h2>Leftovers</h2><!--LEFTOVERS--></section>
+</main>
+<button id="exportBtn">Export feedback</button>
+<script>
+window.RUN_META = /*RUN_META*/{}/*END_RUN_META*/;
+(function(){
+  var arts = Array.prototype.slice.call(document.querySelectorAll('article.finding'));
+  var dims = {
+    verdict: {}, confidence: {}, review: {}
+  };
+  arts.forEach(function(a){
+    dims.verdict[a.dataset.verdict] = true;
+    dims.confidence[a.dataset.confidence] = true;
+    dims.review[a.dataset.review] = true;
+  });
+  var box = document.getElementById('filters');
+  var state = {verdict:{},confidence:{},review:{}};
+  function mk(dim, val, label){
+    state[dim][val] = true;
+    var b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = function(){
+      state[dim][val] = !state[dim][val];
+      b.classList.toggle('off', !state[dim][val]);
+      apply();
+    };
+    box.appendChild(b);
+  }
+  Object.keys(dims.verdict).sort().forEach(function(v){ mk('verdict', v, v); });
+  Object.keys(dims.confidence).sort().forEach(function(v){ mk('confidence', v, 'conf: '+v); });
+  if (dims.review['true']) mk('review','true','needs review');
+  if (dims.review['false']) mk('review','false','no review');
+  function apply(){
+    arts.forEach(function(a){
+      var show = state.verdict[a.dataset.verdict] &&
+                 state.confidence[a.dataset.confidence] &&
+                 state.review[a.dataset.review];
+      a.hidden = !show;
+    });
+  }
+})();
+document.getElementById('exportBtn').onclick = function(){
+  var items = [];
+  document.querySelectorAll('article.finding, article.rollup').forEach(function(a){
+    var sel = a.querySelector('.fb-select');
+    if (sel && sel.value) {
+      items.push({
+        finding_id: a.dataset.fid,
+        classification: sel.value,
+        comment: (a.querySelector('.fb-comment') || {value:''}).value
+      });
+    }
+  });
+  if (!items.length) { alert('No feedback selected.'); return; }
+  var payload = JSON.stringify({run: window.RUN_META, feedback: items}, null, 2);
+  var aEl = document.createElement('a');
+  aEl.href = 'data:application/json;charset=utf-8,' + encodeURIComponent(payload);
+  aEl.download = 'feedback.json';
+  document.body.appendChild(aEl); aEl.click(); aEl.remove();
+};
+</script>
+</body>
+</html>

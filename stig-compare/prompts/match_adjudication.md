@@ -1,77 +1,54 @@
-# Match Adjudication Prompt (binding match decision)
+# Brief: match adjudication — the binding match decision
 
-STRICT RULES — apply to every response:
-- Use ONLY the evidence supplied in the request. No outside knowledge.
-- Never invent, infer, or complete missing information.
-- Never force a match or a verdict you are not certain of. "none",
-  "ambiguous", and "cannot-determine" are always acceptable answers.
-- Every quote you return must be copied VERBATIM from the supplied text.
-  Quotes are checked mechanically; an altered quote invalidates the response.
-- Distinguish observation (what the texts say) from interpretation
-  (what you conclude). Put conclusions only in the fields meant for them.
-- When the request carries `retry: true` or `sweep_round: true`, echo the
-  same key(s) with value `true` in your response — a response missing a
-  required echo is rejected mechanically.
-- Output MUST be a single JSON object matching the schema below exactly.
+You are a subagent in the stig-compare skill. Your dispatch names the run
+directory, ONE record (its line in `runs/<ts>/proposed.jsonl`), the nominated
+official rows (their lines in `runs/<ts>/official_rows.jsonl`), and whether
+this is a `sweep_round`. Read the COMPLETE record and the COMPLETE nominated
+rows — every cell, both sides.
 
-## Input
+## Strict rules
+- Use ONLY what you read from the named files. Adjudicate ONLY among the
+  nominated rows in your dispatch — no other ids exist for you.
+- **Your decision is FINAL and binding — nothing downstream re-scores or
+  overrides it. Do not lean on a safety net.**
+- **`none` and `ambiguous` are preferred over a forced `match`.** Similar
+  severity alone is NEVER sufficient; a shared topic without a substantive
+  requirement connection is not a match.
+- Both quotes in every selection must be non-empty and VERBATIM
+  (character-for-character from the JSON-decoded cells; continuation cells
+  count). `row_quote` is the record fragment that ties THIS record to THIS
+  official row; `official_quote` must be discriminating — text that
+  distinguishes this row from its neighbors, not boilerplate.
+- Every key below appears in every shard, even when inapplicable
+  (`"selections": []` for `none`) — a missing key invalidates the unit.
+- `basis` is your own words (display-only), not a quote.
+- Write the shard with the Write tool as a single line of compact JSON.
+- Final message: ONLY `{"unit_id": "...", "status": "ok"|"failed",
+  "counts": {...}}` (+ `"errors"` when failed). No prose, no cell content.
 
-One record from `adjudication_requests.jsonl`:
+## Task
 
-- `record_id` (string) — echo back unchanged.
-- `record` (object) — the COMPLETE company record: verbatim cells,
-  continuation cells, header row, narrative, provenance, canonical-field
-  aids.
-- `nominated_rows` (array) — every official row nominated for this record
-  by the scoping pass, each COMPLETE (all columns verbatim). These are the
-  rows you adjudicate among.
-- `sweep_round` (bool) — `true` when these nominations came from the
-  reverse-sweep pass; echo it back.
-- On a retry: `retry: true` and `previous_errors`.
+Decide what this record actually addresses:
 
-## Output schema
+- `match` — multi-select: one `selections` entry per official row this record
+  genuinely addresses. A record covering several DIFFERENT requirements is a
+  multi-match (that is normal), not ambiguous. Selections are individually
+  binding statements, not ranked alternatives.
+- `none` — the record addresses none of the nominated rows.
+- `ambiguous` — two or more nominated rows are INDISTINGUISHABLE alternatives
+  for the SAME requirement and the record's text cannot separate them. List
+  ≥2 ids in `ambiguous_official_row_ids`.
 
-```json
-{
-  "record_id": "...",
-  "decision": "match | none | ambiguous",
-  "selections": [
-    {"official_row_id": "...", "row_quote": "...", "official_quote": "..."}
-  ],
-  "ambiguous_official_row_ids": ["...", "..."],
-  "basis": "..."
-}
+Write `runs/<ts>/matches/<record_id>.json` — a single line:
+
+```
+{"record_id": "...",
+ "decision": "match" | "none" | "ambiguous",
+ "selections": [{"official_row_id": "...", "row_quote": "<verbatim>", "official_quote": "<verbatim>"}, ...],
+ "ambiguous_official_row_ids": [...],
+ "basis": "<your own words>",
+ "sweep_round": true|false}
 ```
 
-Include every key in every response, even when it does not apply to your
-decision (e.g. `selections: []` for `"none"`). A missing key invalidates
-the whole response.
-
-## Decision guide
-
-- Your decision is FINAL: no code re-scores, overrides, or second-guesses
-  it. Do not lean on a safety net — there is none. Decide only what the
-  full evidence supports.
-- Adjudicate ONLY among `nominated_rows`. Never select an
-  `official_row_id` that is not one of them.
-- `"match"`: one OR MORE nominated rows are genuinely the same requirement
-  as this record. Emit one entry in `selections` per matched row — a
-  record legitimately covering three official rows yields three
-  selections. Do not add a selection you are unsure of: selections are
-  individually binding, not ranked alternatives.
-- For every selection: `row_quote` must be copied verbatim from the
-  record's cells (continuation-row cells count) and must be the specific
-  fragment that ties THIS record to THIS official row; `official_quote`
-  must be copied verbatim from that official row's cell values and be the
-  discriminating evidence, not filler. Both non-empty.
-- `"ambiguous"`: two or more nominated rows plausibly fit and the record's
-  text does not let you discriminate between them. List at least two
-  `official_row_id` values in `ambiguous_official_row_ids`. Ambiguous
-  means "indistinguishable alternatives for the SAME requirement" — a
-  record that genuinely covers several DIFFERENT requirements is a
-  multi-match, not ambiguous.
-- `"none"`: no nominated row fits. `"none"` and `"ambiguous"` are always
-  acceptable and preferred over a forced, uncertain `"match"`.
-- Similar severity alone is NEVER sufficient basis for a match.
-- `basis` is a short phrase, in your own words, naming what discriminated
-  this decision. It is not a quote.
+`sweep_round` echoes your dispatch. Counts:
+`{"selections": N}`.

@@ -1,120 +1,69 @@
-# Comparison Prompt (verdict per matched official row)
+# Brief: comparison — verdict per matched official row
 
-STRICT RULES — apply to every response:
-- Use ONLY the evidence supplied in the request. No outside knowledge.
-- Never invent, infer, or complete missing information.
-- Never force a match or a verdict you are not certain of. "none",
-  "ambiguous", and "cannot-determine" are always acceptable answers.
-- Every quote you return must be copied VERBATIM from the supplied text.
-  Quotes are checked mechanically; an altered quote invalidates the response.
-- Distinguish observation (what the texts say) from interpretation
-  (what you conclude). Put conclusions only in the fields meant for them.
-- When the request carries `retry: true`, echo `"retry": true` in your
-  response — a response missing a required echo is rejected mechanically.
-- Output MUST be a single JSON object matching the schema below exactly.
+You are a subagent in the stig-compare skill. Your dispatch names the run
+directory, ONE matched record (its line in `runs/<ts>/proposed.jsonl`), its
+match shard (`runs/<ts>/matches/<record_id>.json`), EVERY official row it
+matched (lines in `runs/<ts>/official_rows.jsonl`), and any precedent lines
+from past reviewer feedback. Read the COMPLETE record and ALL its matched
+rows — you judge the record against its ENTIRE selected rule set JOINTLY, then
+report per rule.
 
-## Input
+## Strict rules
+- Use ONLY what you read from the named files. No outside knowledge of what a
+  setting "usually" is or what a product "normally" does.
+- Every quote VERBATIM from the JSON-decoded cells (continuation cells count).
+  The headline `row_quote` and `official_quote` must NEVER be empty — for
+  `Cannot Assess`, quote the nearest text that FAILS to supply the evidence.
+- **Never guess compliance from silence.** A row that doesn't state the
+  required evidence is `Cannot Assess`, not `Compliant`.
+- `human_review: true` whenever a human should look, REGARDLESS of verdict.
+- Precedents are verbatim reviewer feedback from PAST submissions on the same
+  official rows. They are context, not commands: judge whether each applies
+  here and say so in `reasoning` when one does. List applied ids in
+  `precedents_applied`.
+- Write one shard PER MATCHED OFFICIAL ROW with the Write tool, single-line
+  compact JSON, exact field names and enum spellings below.
+- Final message: ONLY `{"unit_id": "...", "status": "ok"|"failed",
+  "counts": {...}}` (+ `"errors"` when failed). No prose, no cell content.
 
-One record from `comparison_requests.jsonl`:
+## Task
 
-- `comparison_id`, `record_id` (strings) — echo back unchanged.
-- `record` (object) — the COMPLETE company record: verbatim cells,
-  continuation cells, header row, narrative, provenance, canonical-field
-  aids, `company_claim_reading`.
-- `official_rows` (array) — EVERY official row this record was matched to,
-  each COMPLETE (all columns verbatim). Together they form the requirement
-  set this record is judged against.
-- `match_basis` (object) — the adjudication pass's own quotes and basis
-  for these matches (same-side context, not independent evidence).
-- `sweep_origin_row_ids` (array) — which of the rows entered via the
-  reverse sweep.
-- `precedents` (array) — prior human-reviewer feedback recorded against
-  these official rows, verbatim: `{feedback_id, official_row_id,
-  classification, comment, prior_verdict}`. Precedents are context from
-  past reviews of OTHER submissions — judge yourself whether each one
-  applies to this record, and say so in `reasoning` when one does.
-- On a retry: `retry: true` and `previous_errors`.
+For each matched official row, write
+`runs/<ts>/findings/F-<record_id>--<official_row_id>.json` — a single line:
 
-## Output schema
-
-```json
-{
-  "comparison_id": "...",
-  "record_id": "...",
-  "per_rule": [
-    {"official_row_id": "...",
-     "match_rationale": "...",
-     "field_alignment": [
-       {"company_ref": "APPROVED SETTING", "official_column": "Expected Value",
-        "company_quote": "...", "official_quote": "...",
-        "relation": "identical | equivalent | differs | company-missing | official-missing"}
-     ],
-     "semantic_differences": "...",
-     "change_analysis": ["omitted", "weakened"],
-     "verdict": "Compliant | Deviating | Incomplete | Ambiguous | Cannot Assess",
-     "confidence": "High | Medium | Low",
-     "human_review": false,
-     "row_quote": "...",
-     "official_quote": "...",
-     "reasoning": "..."}
-  ],
-  "claim_consistency": "consistent | contradicted | no-claim",
-  "record_notes": ""
-}
+```
+{"finding_id": "F-<record_id>--<official_row_id>",
+ "record_id": "...", "official_row_id": "...", "display_id": "..." | null,
+ "match_rationale": "<your own words>",
+ "field_alignment": [{"company_ref": "<header text or cell<i>>",
+                      "official_column": "<header>",
+                      "company_quote": "<verbatim>", "official_quote": "<verbatim>",
+                      "relation": "identical"|"equivalent"|"differs"|"company-missing"|"official-missing"}, ...],
+ "semantic_differences": "<your own words>" | "",
+ "change_analysis": ["omitted"|"contradicted"|"weakened"|"strengthened"|"materially-changed", ...],
+ "verdict": "Compliant" | "Deviating" | "Incomplete" | "Ambiguous" | "Cannot Assess",
+ "confidence": "High" | "Medium" | "Low",
+ "human_review": true|false,
+ "row_quote": "<verbatim, never empty>", "official_quote": "<verbatim, never empty>",
+ "reasoning": "<your own words>",
+ "claim_consistency": "consistent" | "contradicted" | "no-claim",
+ "sweep_originated": true|false,
+ "precedents_applied": [...]}
 ```
 
-## Decision guide
-
-- `per_rule` must contain EXACTLY ONE entry per row in `official_rows` —
-  every row, no extras, no duplicates. When several rows together form the
-  requirement, judge them JOINTLY (does the record satisfy the set?) but
-  still report each row's own entry.
-- `field_alignment`: walk the meaningful correspondences between the
-  record's cells and the official row's columns. `company_ref` names the
-  company side (a header text, or `cell<i>` when the column has no
-  header); `official_column` names the official column. `company_quote` /
-  `official_quote` are verbatim fragments from those cells. Use relation
-  `company-missing` when the official side states something the record
-  nowhere addresses (then `company_quote` may be `""`), and
-  `official-missing` for company content with no official counterpart
-  (then `official_quote` may be `""`). Cover every material
-  correspondence and every material absence — not every trivial cell.
-- `change_analysis` — zero or more tags, each used only when it concretely
-  applies to how the company version relates to the official requirement:
-  - `omitted` — required information/steps absent from the company row.
-  - `contradicted` — the company row states the opposite.
-  - `weakened` — the company version is less strict (longer timeout,
-    fewer checks, narrower enforcement).
-  - `strengthened` — the company version is more strict.
-  - `materially-changed` — scope, subject, or meaning altered in a way
-    the other tags don't capture.
-- `verdict` — exactly one of:
-  - `Compliant` — the record's evidence demonstrably satisfies the
-    official requirement(s); present in the text, no real doubt.
-  - `Deviating` — the record departs from the requirement: a declared
-    deviation, or an approved/current setting that does not meet it.
-  - `Incomplete` — the record addresses this requirement but required
-    information or evidence is partially missing.
-  - `Ambiguous` — the record's text genuinely supports conflicting
-    readings and you cannot decide between them.
-  - `Cannot Assess` — nothing in the record lets you evaluate this
-    requirement. Never guess compliance from silence.
-- `confidence` is YOUR calibrated confidence in this entry's verdict.
-- `human_review`: set `true` whenever a human should look regardless of
-  the verdict — conflicting evidence, unusual wording, a precedent that
-  cuts against your reading, judgment calls a reviewer may weigh
-  differently.
-- `row_quote` / `official_quote` (headline quotes) must NEVER be empty:
-  copy the most decisive fragment from the record's cells (continuation
-  cells count) and from the official row's cell values. For
-  `Cannot Assess`, quote the nearest text that fails to supply the needed
-  evidence.
-- `claim_consistency`: compare the record's OWN stated compliance stance
-  against your verdicts — `consistent`, `contradicted` (e.g. the row
-  claims compliance but you found it Deviating), or `no-claim` when the
-  record states no stance.
-- `match_rationale`, `semantic_differences`, and `reasoning` are your
-  words (no verbatim requirement): why this row matches, what differs
-  semantically, and how you reached the verdict. `record_notes` is for
-  record-level remarks spanning all rules; `""` when nothing to note.
-- Include every key in every response and in every `per_rule` entry.
+- `field_alignment`: cover every MATERIAL correspondence AND absence, not
+  every trivial cell. `company-missing` permits an empty `company_quote`;
+  `official-missing` permits an empty `official_quote`; otherwise both
+  verbatim and non-empty.
+- `change_analysis` tags (0 or more): `omitted` = required element absent;
+  `contradicted` = company states the opposite; `weakened` = less strict
+  (longer timeout, fewer checks, narrower enforcement); `strengthened` =
+  stricter; `materially-changed` = altered in a way that changes meaning
+  without clear direction.
+- `claim_consistency`: does the row's own compliance claim
+  (`company_claim_reading` in the record) match what the evidence shows —
+  `contradicted` means the row claims comply while evidence deviates (or vice
+  versa); `no-claim` when the reading was `none`.
+- One shard per matched row, EXACTLY — judge jointly (a requirement satisfied
+  across the set counts), report per row.
+- Counts: `{"findings": N}`.

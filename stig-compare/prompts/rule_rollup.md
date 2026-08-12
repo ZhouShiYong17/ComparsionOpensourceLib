@@ -1,62 +1,41 @@
-# Rule Rollup Prompt (joint assessment of one official row across records)
+# Brief: rule rollup — joint assessment of one official row across records
 
-STRICT RULES — apply to every response:
-- Use ONLY the evidence supplied in the request. No outside knowledge.
-- Never invent, infer, or complete missing information.
-- Never force a match or a verdict you are not certain of. "none",
-  "ambiguous", and "cannot-determine" are always acceptable answers.
-- Every quote you return must be copied VERBATIM from the supplied text.
-  Quotes are checked mechanically; an altered quote invalidates the response.
-- Distinguish observation (what the texts say) from interpretation
-  (what you conclude). Put conclusions only in the fields meant for them.
-- When the request carries `retry: true`, echo `"retry": true` in your
-  response — a response missing a required echo is rejected mechanically.
-- Output MUST be a single JSON object matching the schema below exactly.
+You are a subagent in the stig-compare skill. Your dispatch names the run
+directory, ONE official row that two or more records matched (its line in
+`runs/<ts>/official_rows.jsonl`), those records (lines in
+`runs/<ts>/proposed.jsonl`), and their finding shards
+(`runs/<ts>/findings/F-*--<official_row_id>.json`). Read everything COMPLETE.
 
-## Input
+## Strict rules
+- Use ONLY what you read from the named files.
+- **Your rollup may disagree with per-record verdicts — that disagreement is
+  surfaced as a warning in the report; it NEVER overwrites a per-record
+  finding.** Do not soften your joint judgment to agree.
+- `contributing_record_ids` must echo exactly the record ids in your dispatch
+  (any order, no extras, no omissions).
+- Write the shard with the Write tool, single-line compact JSON, exact enum
+  spellings below.
+- Final message: ONLY `{"unit_id": "...", "status": "ok"|"failed",
+  "counts": {...}}` (+ `"errors"` when failed). No prose, no cell content.
 
-One record from `rollup_requests.jsonl`:
+## Task
 
-- `rollup_id` (string) — echo back unchanged.
-- `official_row` (object) — one COMPLETE official row (all columns
-  verbatim) that more than one company record matched.
-- `company_records` (array) — every matching company record, COMPLETE.
-- `per_record_findings` (array) — each contributing record's comparison
-  finding for this row, verbatim: `{record_id, verdict, change_analysis,
-  reasoning, row_quote, official_quote}`.
-- On a retry: `retry: true` and `previous_errors`.
+The core question: **taken TOGETHER, do these records satisfy this official
+requirement?** A requirement split across several rows may be jointly covered
+even though each row alone looks partial — or the rows may contradict each
+other.
 
-## Output schema
+Write `runs/<ts>/rollups/RU-<official_row_id>.json` — a single line:
 
-```json
-{
-  "rollup_id": "...",
-  "contributing_record_ids": ["CR-...", "CR-..."],
-  "joint_verdict": "Compliant | Deviating | Incomplete | Ambiguous | Cannot Assess",
-  "coverage_of_requirement": "fully-covered | partially-covered | conflicting",
-  "reasoning": "...",
-  "confidence": "High | Medium | Low",
-  "human_review": false
-}
+```
+{"rollup_id": "RU-<official_row_id>", "official_row_id": "...",
+ "display_id": "..." | null,
+ "contributing_record_ids": [...],
+ "joint_verdict": "Compliant" | "Deviating" | "Incomplete" | "Ambiguous" | "Cannot Assess",
+ "coverage_of_requirement": "fully-covered" | "partially-covered" | "conflicting",
+ "reasoning": "<your own words>",
+ "confidence": "High" | "Medium" | "Low",
+ "human_review": true|false}
 ```
 
-## Decision guide
-
-- The question: taken TOGETHER, do these company records satisfy this
-  official row's requirement? A requirement split across several rows may
-  be fully covered jointly even though each row alone looks partial — or
-  the rows may conflict with each other.
-- `contributing_record_ids` must echo exactly the `record_id` values of
-  `company_records` (any order, no extras, no omissions).
-- `coverage_of_requirement`: `fully-covered` when the records jointly
-  address every part of the requirement; `partially-covered` when parts
-  remain unaddressed; `conflicting` when the records disagree with each
-  other about the same requirement.
-- `joint_verdict` uses the same verdict vocabulary as the comparison pass,
-  applied to the JOINT picture.
-- You may disagree with the individual per-record verdicts — say so in
-  `reasoning`. Your disagreement is surfaced as a warning for human
-  review; it never overwrites the per-record findings.
-- `human_review`: `true` whenever a human should inspect the joint
-  picture (conflicting records, split coverage that is hard to call).
-- Include every key in every response.
+Counts: `{"records": N}`.

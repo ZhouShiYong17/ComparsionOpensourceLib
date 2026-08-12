@@ -1,33 +1,41 @@
-"""Coverage accounting over skeleton rows (spec section 6). Pure arithmetic."""
+"""Coverage accounting over skeleton rows. Pure arithmetic.
+
+Every bucket is a count of LLM decisions (table classifications, row
+dispositions, match decisions) or pipeline statuses — Python only counts,
+it never judges. `bucket_for_records` is the single bucket function; the
+finalize leftover sections derive from the same decisions so report and
+coverage can never drift.
+"""
 from collections import Counter
 
 RED_BANNER_THRESHOLD = 0.10
-_MATCHED_TIERS = ("T0", "T1", "T2")
 _PROCESSABLE = ("stig_relevant", "uncertain")
 
 
-def _bucket_for_records(records, match_by_record, ignored_row_ids):
+def bucket_for_records(records, match_by_record):
+    """Bucket one skeleton row from its records' statuses and LLM match
+    decisions. Priority: matched > ambiguous > unmatched > unresolved."""
     if not records:
         return "extraction_failed"
-    if any(r["record_id"] in ignored_row_ids or
-           r.get("row_id") in ignored_row_ids for r in records):
-        return "ignored_by_rule"
     ok_records = [r for r in records if r.get("status") == "ok"]
     if not ok_records:
         return "extraction_failed"
-    tiers = []
-    for r in ok_records:
-        m = match_by_record.get(r["record_id"])
-        if m and m.get("tier") in _MATCHED_TIERS and m.get("matched_rule_ids"):
-            return "matched"
-        tiers.append(m.get("tier") if m else None)
-    if any(t == "T3" for t in tiers):
+    decisions = [(match_by_record.get(r["record_id"]) or {}).get("decision")
+                 for r in ok_records]
+    if any(d == "match" for d in decisions):
+        return "matched"
+    if any(d == "ambiguous" for d in decisions):
         return "ambiguous"
-    return "unmatched"
+    if all(d == "none" for d in decisions):
+        return "unmatched"
+    # A decision that is still None (pass never ran) or a two-strike
+    # "unresolved-llm-output-rejected" settlement: honest pipeline statuses,
+    # never verdicts.
+    return "unresolved"
 
 
 def compute(skeleton_tables, table_state_by_index, company_records,
-            official_rules, match_results, ignored_row_ids):
+            official_rows, match_results):
     match_by_record = {m["record_id"]: m for m in match_results}
     recs_by_row = {}
     for rec in company_records:
@@ -62,8 +70,8 @@ def compute(skeleton_tables, table_state_by_index, company_records,
             if disp == "continuation":
                 continuations.append((ti, parents.get(ri)))
                 continue
-            bucket = _bucket_for_records(recs_by_row.get((ti, ri), []),
-                                         match_by_record, ignored_row_ids)
+            bucket = bucket_for_records(recs_by_row.get((ti, ri), []),
+                                        match_by_record)
             row_buckets[(ti, ri)] = bucket
             c[bucket] += 1
     for ti, parent in continuations:
@@ -71,22 +79,23 @@ def compute(skeleton_tables, table_state_by_index, company_records,
 
     company = {"total": total, "matched": c["matched"],
                "ambiguous": c["ambiguous"], "unmatched": c["unmatched"],
+               "unresolved": c["unresolved"],
                "ignored_irrelevant_table": c["ignored_irrelevant_table"],
-               "ignored_by_rule": c["ignored_by_rule"],
                "separator": c["separator"],
                "extraction_failed": c["extraction_failed"]}
 
-    matched_rules = Counter()
+    matched_rows = Counter()
     for m in match_results:
-        if m.get("tier") in _MATCHED_TIERS:
-            for rid in m.get("matched_rule_ids", []):
-                matched_rules[rid] += 1
-    official_ids = {r["rule_id"] for r in official_rules}
-    addressed = sum(1 for rid in official_ids if matched_rules.get(rid))
+        if m.get("decision") == "match":
+            for oid in m.get("selected_official_row_ids", []):
+                matched_rows[oid] += 1
+    official_ids = {r["official_row_id"] for r in official_rows}
+    addressed = sum(1 for oid in official_ids if matched_rows.get(oid))
     official = {"total": len(official_ids), "addressed": addressed,
                 "unaddressed": len(official_ids) - addressed,
-                "duplicate_coverage_rule_ids":
-                    sorted(rid for rid, n in matched_rules.items() if n > 1)}
+                "multi_matched_row_ids":
+                    sorted(oid for oid, n in matched_rows.items()
+                           if n > 1 and oid in official_ids)}
 
     warnings = []
     bucket_sum = sum(v for k, v in company.items() if k != "total")
@@ -97,7 +106,7 @@ def compute(skeleton_tables, table_state_by_index, company_records,
     if company["extraction_failed"] > 0:
         warnings.append({"code": "extraction-failures",
                          "detail": str(company["extraction_failed"])})
-    bad = company["extraction_failed"] + company["ignored_by_rule"]
+    bad = company["extraction_failed"] + company["unresolved"]
     if total and bad / total > RED_BANNER_THRESHOLD:
         warnings.append({"code": "low-coverage-red-banner",
                          "detail": f"{bad}/{total} rows not compared"})

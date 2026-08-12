@@ -1,18 +1,23 @@
-"""Pipeline orchestration: start -> (Claude) -> resolve -> (Claude) -> finalize.
+"""Pipeline orchestration: start -> (Claude) -> resolve -> ... -> finalize.
 
-Claude never talks to this module directly; it reads *_requests.jsonl and writes
-*_responses.jsonl. Everything it writes is validated before use.
+Claude never talks to this module directly; it reads *_requests.jsonl and
+writes *_responses.jsonl. Everything it writes is validated mechanically
+before use. Python makes NO semantic decisions here: it parses, chunks by
+size, routes on enums the LLM chose, counts, and settles two-strike
+failures with pipeline statuses (never verdicts).
 
-*_responses.jsonl files are Claude/attacker-controlled input and are read with
-tolerant, line-by-line parsing (see _read_response_lines/_parse_response_line):
-a malformed line never aborts the batch, it becomes a validation_failures.jsonl
-entry. common.read_jsonl (strict) is reserved for the pipeline's own artifacts.
+*_responses.jsonl files are Claude/attacker-controlled input and are read
+with tolerant, line-by-line parsing (_read_response_lines/
+_parse_response_line): a malformed line never aborts the batch, it becomes
+a validation_failures.jsonl entry. common.read_jsonl (strict) is reserved
+for the pipeline's own artifacts.
 
-Every response line is also fingerprinted and recorded as "consumed" in
-consumed_responses.json before it is ever applied. Replaying an unchanged
-*_responses.jsonl file (the same Claude answer seen again on a later `resolve`/
-`finalize` invocation) is therefore a full no-op: it is neither re-applied nor
-re-logged as a fresh failure, and it never advances a retry counter.
+Every response line is fingerprinted and recorded as "consumed" in
+consumed_responses.json before it is applied, so replaying an unchanged
+responses file is a full no-op. Retried units require a `retry: true` echo
+(and sweep-round adjudications a `sweep_round: true` echo), so a re-round
+answer is never byte-identical to a consumed line and can never be
+swallowed by the fingerprint dedup.
 """
 import argparse
 import hashlib
@@ -21,30 +26,20 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-import candidates as candidates_mod
 import canonical
 import common
-import compare_values
 import coverage as coverage_mod
 import extract
-import normalize
-import rules as rules_mod
+import payloads
+import schema
 import skeleton
 import validate
 
 PKG_ROOT = Path(__file__).resolve().parent.parent
 
-_COMPANY_NORM_FIELDS = ["stig_description", "stig_objective_or_requirement",
-                        "stig_command_or_value",
-                        "company_approved_setting_or_expected_value",
-                        "observed_value_or_evidence"]
-_OFFICIAL_NORM_FIELDS = ["title", "check_text", "fix_text", "expected_value"]
-
-_MATCHED_TIERS = ("T0", "T1", "T2")
-
-_SKEPTIC_OUTCOMES = {"upheld", "refuted", "undetermined"}
-
 _NO_RULE = object()  # sentinel: "this failure record has no rule_id field"
+
+_SETTLED_NO_MATCH = ("none", "unresolved-llm-output-rejected")
 
 
 # --------------------------------------------------------------------------
@@ -60,7 +55,6 @@ def _read_jsonl_opt(path):
 
 
 def _append_jsonl(path, new_records):
-    """Read the current content of an accumulating log, append, rewrite."""
     if not new_records:
         return
     existing = _read_jsonl_opt(path)
@@ -69,11 +63,7 @@ def _append_jsonl(path, new_records):
 
 
 def _read_response_lines(path):
-    """Tolerant raw-line reader for *_responses.jsonl (Claude-controlled input).
-
-    Returns the non-empty, stripped raw text of each line. Parsing happens
-    separately in _parse_response_line so a malformed line never raises here.
-    """
+    """Tolerant raw-line reader for *_responses.jsonl (Claude-controlled)."""
     path = Path(path)
     if not path.exists():
         return []
@@ -87,13 +77,7 @@ def _read_response_lines(path):
 
 
 def _parse_response_line(raw_line):
-    """Parse one *_responses.jsonl line. Never raises.
-
-    Returns (obj, None) on a well-formed JSON object, or (None, error_code)
-    where error_code is "malformed-json" (invalid JSON syntax, or valid JSON
-    that isn't an object) so the caller can record a validation failure
-    instead of crashing.
-    """
+    """Parse one *_responses.jsonl line. Never raises."""
     try:
         obj = json.loads(raw_line)
     except (json.JSONDecodeError, ValueError):
@@ -101,19 +85,6 @@ def _parse_response_line(raw_line):
     if not isinstance(obj, dict):
         return None, "malformed-json"
     return obj, None
-
-
-def _type_guard(resp, str_fields, list_fields=()):
-    """Return the names of present fields whose type would crash downstream
-    string/list handling (e.g. common.fold_ws, len(), set()) -- present but
-    non-string (and not None) string fields, or present but non-list list
-    fields. Missing fields are left to the normal missing-key validation."""
-    bad = [k for k in str_fields
-          if k in resp and resp[k] is not None and not isinstance(resp[k], str)]
-    for k in list_fields:
-        if k in resp and not isinstance(resp[k], list):
-            bad.append(k)
-    return bad
 
 
 def _mk_failure(row_id, kind, errors, response, rule_id=_NO_RULE):
@@ -131,12 +102,8 @@ def _consumed_path(run_dir):
 
 def _load_consumed(run_dir):
     p = _consumed_path(run_dir)
-    if p.exists():
-        data = json.loads(p.read_text(encoding="utf-8"))
-    else:
-        data = {}
-    for k in ("table_mapping", "canonicalize", "matching", "sweep", "semantic",
-              "skeptic"):
+    data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    for k in schema.RESPONSE_KINDS:
         data.setdefault(k, [])
     return data
 
@@ -150,227 +117,102 @@ def _fingerprint(raw_line):
     return hashlib.sha256(raw_line.encode("utf-8")).hexdigest()
 
 
-def _rule_text(rule):
-    return " ".join([rule.get("title", ""), rule.get("check_text", ""),
-                     rule.get("fix_text", "")])
+def _psize(obj):
+    return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
 
 
-def _extra_fields_for(table, column_mapping, row):
-    header = table["header_row"]
-    out = {}
-    for k, target in column_mapping.items():
-        if target != "extra_field":
-            continue
-        i = int(k)
-        val = row["cells"][i] if i < len(row["cells"]) else ""
-        if common.fold_ws(val):
-            name = header[i] if i < len(header) and \
-                common.fold_ws(str(header[i])) else f"col{i}"
-            out[str(name)] = common.fold_ws(val)
-    return out
+def _chunk_by_bytes(items, budget):
+    """Order-preserving greedy chunking by serialized size. Always at least
+    one item per chunk — size arithmetic only, never content selection."""
+    chunks, current, used = [], [], 0
+    for item in items:
+        size = _psize(item)
+        if current and used + size > budget:
+            chunks.append(current)
+            current, used = [], 0
+        current.append(item)
+        used += size
+    if current:
+        chunks.append(current)
+    return chunks
 
 
-def _build_table_records(table, ts):
-    """Walk a fully-canonicalized table's stored chunk entries in row order
-    and build canonical records. Mutates ts (row_dispositions, parent_of).
-    Returns the new records. Belt-and-braces: rows the validator somehow
-    never saw become extraction-failed records via canonical.reconcile."""
-    rows_by_index = {r["row_index"]: r for r in table["rows"]}
-    entries = []
-    for chunk in ts["chunks"].values():
-        entries.extend(chunk.get("entries", []))
-    entries.sort(key=lambda e: e["row_index"])
-
-    records = []
-    current_context = ts["context_grouping"]
-    last_record_row = None
-    for entry in entries:
-        ri = entry["row_index"]
-        disp = entry["disposition"]
-        ts["row_dispositions"][str(ri)] = disp
-        if disp == "separator":
-            st = common.fold_ws(entry.get("separator_text", ""))
-            current_context = ts["context_grouping"] + \
-                (" | " + st if st else "")
-            continue
-        if disp == "continuation":
-            if last_record_row is None:
-                ts["row_dispositions"][str(ri)] = "record"
-                records.append(canonical.failed_record(
-                    table, rows_by_index[ri], "orphan-continuation"))
-            else:
-                ts["parent_of"][str(ri)] = last_record_row
-            continue
-        last_record_row = ri
-        for rec_resp in entry["records"]:
-            records.append(canonical.build_record(
-                table, rows_by_index[ri], rec_resp["sub_index"],
-                rec_resp["fields"], rec_resp["field_provenance"],
-                _extra_fields_for(table, ts["column_mapping"],
-                                  rows_by_index[ri]),
-                rec_resp.get("interpretation_note", ""), current_context))
-    for ri in canonical.reconcile(
-            table, {int(k): v for k, v in ts["row_dispositions"].items()}):
-        ts["row_dispositions"][str(ri)] = "record"
-        records.append(canonical.failed_record(
-            table, rows_by_index[ri], "reconcile-missing"))
-    return records
-
-
-def _matching_request(record, m, rules_by_id, extra=None):
-    req = {"record_id": record["record_id"], "record": record,
-           "candidates": [rules_by_id[c["rule_id"]] | {"_score": c["score"]}
-                          for c in m["candidates"]
-                          if c["rule_id"] in rules_by_id],
-           "instructions_file": "prompts/matching.md"}
-    if extra:
-        req.update(extra)
-    return req
-
-
-def _context_for_row(row, doc_type, field=""):
-    return {"document_type": doc_type,
-            "sheet_or_section": row.get("source_reference", {}).get(
-                "sheet_or_section", ""),
-            "field": field}
+def _new_match_state(record_id, batch):
+    return {"record_id": record_id, "scoping_batch": batch,
+            "decision": None, "basis": "",
+            "selected_official_row_ids": [],
+            "ambiguous_official_row_ids": [],
+            "row_quotes": {}, "official_quotes": {},
+            "nominations": [], "scoping_incomplete": False,
+            "adjudication_failures": 0, "adjudication_emitted": False,
+            "sweep_round": False, "sweep_origin_row_ids": [],
+            "comparison_units": [], "claim_consistency": None,
+            "record_notes": "", "warnings": []}
 
 
 def _ensure_match_fields(m):
-    """Backfill pipeline-tracked bookkeeping fields onto a match_state record.
-
-    candidates.generate() only produces record_id/tier/matched_rule_ids
-    /margin_flag/candidates; everything else here is added and persisted by
-    this module.
-    """
-    m.setdefault("matched_rule_ids", [])
-    m.setdefault("match_failures", 0)
-    m.setdefault("semantic_failures", {})
-    m.setdefault("retried", False)
-    m.setdefault("warnings", [])
-    m.setdefault("row_quotes", {})
-    m.setdefault("rule_quotes", {})
-    m.setdefault("ambiguous_rule_ids", [])
-    m.setdefault("verdict_done_rules", [])
-    m.setdefault("sweep_origin_rule_ids", [])
+    for k, v in _new_match_state("", "").items():
+        m.setdefault(k, v)
     return m
 
 
-def _build_finding(record_id, row_id, rule_id, verdict, basis, deterministic,
-                    finding_type, observation, interpretation,
-                    applied_rules_list, match_row, company_record,
-                    official_rule, approved_alignment=None):
+def _load_precedents():
+    """Prior human feedback, mechanically keyed by official row. The LLM
+    judges applicability; Python only looks up by id."""
+    return _read_jsonl_opt(PKG_ROOT / "feedback" / "precedents.jsonl")
+
+
+def _precedents_for(precedents, official_row):
+    oid = official_row.get("official_row_id")
+    did = official_row.get("display_id")
+    out = []
+    for p in precedents:
+        if p.get("official_row_id") == oid or \
+                (did and p.get("display_id") == did):
+            out.append({"feedback_id": p.get("feedback_id"),
+                        "official_row_id": oid,
+                        "classification": p.get("classification"),
+                        "comment": p.get("comment"),
+                        "prior_verdict": p.get("prior_verdict")})
+    return out
+
+
+def _build_finding(record, m, official_row, entry, claim_consistency,
+                   record_notes, split):
+    """One finding per (record, official row), copied verbatim from the
+    LLM's comparison output plus complete both-side payloads."""
+    rid = record["record_id"]
+    oid = official_row["official_row_id"]
     return {
-        "finding_id": common.finding_id(record_id, rule_id,
-                                        finding_type or "deterministic"),
-        "record_id": record_id, "row_id": row_id, "rule_id": rule_id,
-        "verdict": verdict,
-        "finding_type": finding_type, "deterministic": deterministic,
-        "basis": basis, "observation": observation,
-        "interpretation": interpretation, "skeptic": None,
-        "disputed": False,
-        "applied_rules": list(applied_rules_list or []),
-        "approved_alignment": approved_alignment,
-        "match": {"tier": match_row["tier"], "candidates": match_row["candidates"]},
-        "company_row": {
-            "original_company_text": company_record.get("original_company_text", ""),
-            "source_reference": company_record.get("source_reference", {})},
-        "official_rule": {
-            "rule_id": official_rule.get("rule_id", rule_id),
-            "title": official_rule.get("title", ""),
-            "check_text": official_rule.get("check_text", ""),
-            "expected_value": official_rule.get("expected_value", "")},
-        "confidence": None, "human_review_needed": None,
+        "finding_id": common.finding_id(rid, oid, "comparison"),
+        "record_id": rid, "row_id": record["row_id"],
+        "official_row_id": oid,
+        "display_id": official_row.get("display_id"),
+        "verdict": entry["verdict"],
+        "verdict_source": "comparison",
+        "change_analysis": list(entry["change_analysis"]),
+        "match_rationale": entry["match_rationale"],
+        "semantic_differences": entry["semantic_differences"],
+        "reasoning": entry["reasoning"],
+        "field_alignment": entry["field_alignment"],
+        "row_quote": entry["row_quote"],
+        "official_quote": entry["official_quote"],
+        "confidence": entry["confidence"],
+        "human_review": entry["human_review"],
+        "human_review_needed": None, "review_reasons": [],
+        "claim_reading": record.get("company_claim_reading", "none"),
+        "claim_consistency": claim_consistency,
+        "record_notes": record_notes,
+        "sweep_originated": oid in m.get("sweep_origin_row_ids", []),
+        "comparison_split": bool(split),
+        "validation": None, "disputed": False,
+        "match_basis": {"basis": m.get("basis", ""),
+                        "row_quote": m.get("row_quotes", {}).get(oid, ""),
+                        "official_quote":
+                            m.get("official_quotes", {}).get(oid, "")},
+        "company_row": payloads.company_record_payload(record),
+        "official_row": payloads.official_row_payload(official_row),
     }
-
-
-def _run_deterministic_verdicts(registry, doc_type, match_state,
-                                records_by_id, rules_by_id):
-    """Compute deterministic verdicts / semantic hand-off for every
-    (record, rule_id) pair produced by a matched record (tier in T0/T1/T2)
-    that hasn't had this done yet (rule_id not in m["verdict_done_rules"]).
-    A record can carry more than one matched_rule_ids entry (multi-select
-    matching), so this iterates pairs, not records. Mutates each match_state
-    record in place (appends to verdict_done_rules, may append a warning)
-    and is therefore idempotent: calling it again once every pair has been
-    processed is a no-op.
-
-    Shared by cmd_resolve (immediately after a fresh matching pass) and
-    cmd_finalize (closes the gap where a record was matched -- e.g. a T0/T1
-    raw-text match already assigned during `start` -- but `resolve` was
-    never called before `finalize`; previously that left matched-record
-    counts in coverage with no corresponding finding and no warning).
-
-    Returns (new_findings, new_semantic_requests).
-    """
-    new_findings = []
-    new_semantic_requests = []
-    for m in match_state:
-        if m["tier"] not in _MATCHED_TIERS or not m.get("matched_rule_ids"):
-            continue
-        record = records_by_id.get(m["record_id"])
-        for rule_id in m["matched_rule_ids"]:
-            if rule_id in m["verdict_done_rules"]:
-                continue
-            rule = rules_by_id.get(rule_id)
-            if record is None or rule is None:
-                # Matched to a rule_id that doesn't resolve to a real
-                # official rule (state corruption / shortlist-registry
-                # mismatch): never leave this silently unprocessed forever
-                # -- flag it and stop retrying.
-                m["verdict_done_rules"].append(rule_id)
-                m["warnings"].append("unknown-matched-rule")
-                continue
-            context = _context_for_row(record, doc_type,
-                                       field="expected_value")
-            applied, _ = rules_mod.applicable_rules(registry, context)
-            observed_raw = record.get("observed_value_or_evidence", "")
-            expected_raw = rule.get("expected_value", "")
-            eq_rule_id = None
-            if common.fold_ws(observed_raw):
-                # The equivalence shortcut must never override the missing-
-                # evidence hard rule: only consult it when there is evidence.
-                eq_rule_id = rules_mod.equivalent_by_rule(
-                    applied, observed_raw, expected_raw)
-            applied_rules_list = []
-            if eq_rule_id:
-                result = {"verdict": "Compliant",
-                          "basis": "rule-equivalence",
-                          "deterministic": True, "approved_alignment": None,
-                          "observation": {"observed": observed_raw,
-                                          "expected": expected_raw}}
-                applied_rules_list = [eq_rule_id]
-            else:
-                result = compare_values.deterministic_verdict(record, rule)
-            m["verdict_done_rules"].append(rule_id)
-            if result is not None:
-                new_findings.append(_build_finding(
-                    m["record_id"], record["row_id"], rule_id,
-                    result["verdict"], result["basis"],
-                    result["deterministic"], None, result["observation"],
-                    None, applied_rules_list, m, record, rule,
-                    approved_alignment=result.get("approved_alignment")))
-            else:
-                new_semantic_requests.append(
-                    {"record_id": m["record_id"], "rule_id": rule_id,
-                     "record": record, "rule": rule,
-                     "instructions_file": "prompts/semantic_compare.md"})
-    return new_findings, new_semantic_requests
-
-
-def assign_confidence(match_record, finding, skeptic_outcome):
-    if match_record.get("margin_flag") or match_record.get("retried"):
-        return "Low"
-    deterministic = bool(finding.get("deterministic"))
-    tier = match_record.get("tier")
-    if finding.get("rule_id") in match_record.get("sweep_origin_rule_ids", []):
-        if deterministic or skeptic_outcome == "upheld":
-            return "Medium"
-        return "Low"
-    if tier in ("T0", "T1", "T2") and deterministic:
-        return "High"
-    if tier == "T2" and not deterministic and skeptic_outcome == "upheld":
-        return "Medium"
-    return "Low"
 
 
 # --------------------------------------------------------------------------
@@ -386,13 +228,6 @@ def cmd_start(args):
     except Exception as e:                        # no document text in errors
         print(f"pipeline: cannot read file: {type(e).__name__}", file=sys.stderr)
         return 2
-    normalize.add_normalized(official["records"], _OFFICIAL_NORM_FIELDS)
-
-    registry = rules_mod.load_registry(PKG_ROOT / "rules" / "registry.json")
-    doc_type = Path(args.company).suffix.lstrip(".").lower()
-    _, conflicts = rules_mod.applicable_rules(
-        registry, {"document_type": doc_type, "sheet_or_section": "",
-                   "field": ""})
 
     manifest = {
         "official_file": Path(args.official).name,
@@ -401,25 +236,48 @@ def cmd_start(args):
         "company_sha256": common.file_sha256(args.company),
         "started": datetime.now().isoformat(timespec="seconds"),
         "versions": common.load_versions(PKG_ROOT),
-        "registry_version": registry["registry_version"],
-        "rule_conflicts": conflicts,
     }
     (run_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=1), encoding="utf-8")
-    common.write_jsonl(run_dir / "official_rules.jsonl", official["records"])
+    common.write_jsonl(run_dir / "official_rows.jsonl", official["rows"])
     (run_dir / "skeleton.json").write_text(
         json.dumps(skel, indent=1), encoding="utf-8")
     (run_dir / "extract_warnings.json").write_text(json.dumps(
         official["warnings"] + skel["warnings"], indent=1), encoding="utf-8")
+
+    # Official-structure pass: one request per sheet/section, annotation only.
+    groups = []
+    for row in official["rows"]:
+        if not groups or groups[-1][0] != row["sheet_or_section"]:
+            groups.append((row["sheet_or_section"], []))
+        groups[-1][1].append(row)
+    structure_requests, structure_state = [], []
+    for n, (section, rows) in enumerate(groups):
+        sid = f"OS-{n}"
+        structure_requests.append({
+            "structure_id": sid, "sheet_or_section": section,
+            "headers": rows[0]["headers"],
+            "sample_rows": [r["cells"]
+                            for r in rows[:schema.STRUCTURE_SAMPLE_ROWS]],
+            "row_count": len(rows),
+            "instructions_file": "prompts/official_structure.md"})
+        structure_state.append({"structure_id": sid,
+                                "sheet_or_section": section,
+                                "done": False, "failures": 0})
+    common.write_jsonl(run_dir / "official_structure_requests.jsonl",
+                       structure_requests)
+    common.write_jsonl(run_dir / "official_structure_state.jsonl",
+                       structure_state)
 
     mapping_requests = [
         {"table_index": t["table_index"],
          "sheet_or_section": t["sheet_or_section"],
          "preceding_narrative": t["preceding_narrative"],
          "header_row": t["header_row"],
-         "sample_rows": [r["cells"] for r in t["rows"][:5]],
+         "sample_rows": [r["cells"]
+                         for r in t["rows"][:schema.TABLE_MAPPING_SAMPLE_ROWS]],
          "row_count": len(t["rows"]),
-         "header_hints": extract.COMPANY_HEADER_HINTS,
+         "total_bytes": _psize([r["cells"] for r in t["rows"]]),
          "instructions_file": "prompts/table_mapping.md"}
         for t in skel["tables"]]
     common.write_jsonl(run_dir / "table_mapping_requests.jsonl",
@@ -428,89 +286,218 @@ def cmd_start(args):
         {"table_index": t["table_index"], "classification": None,
          "irrelevant_reason": "", "column_mapping": {},
          "context_grouping": "", "mapping_failures": 0,
-         "row_dispositions": {}, "parent_of": {}, "chunks": {}}
+         "row_dispositions": {}, "parent_of": {}, "chunks": {},
+         "records_built": False}
         for t in skel["tables"]])
     common.write_jsonl(run_dir / "company_records.jsonl", [])
     common.write_jsonl(run_dir / "match_state.jsonl", [])
+    common.write_jsonl(run_dir / "scoping_state.jsonl", [])
 
     print(f"start: tables={len(skel['tables'])} "
+          f"official_rows={len(official['rows'])} "
+          f"structure_pending={len(structure_requests)} "
           f"mapping_pending={len(mapping_requests)}")
     return 0
 
 
 # --------------------------------------------------------------------------
-# resolve
+# record building (interpretation results -> stored records)
+# --------------------------------------------------------------------------
+
+def _build_table_records(table, ts):
+    """Walk a fully-interpreted table's stored chunk entries in row order and
+    build records. Mutates ts (row_dispositions, parent_of). Continuation
+    rows attach their verbatim cells to the parent row's records. Rows the
+    validator somehow never saw become extraction-failed records via
+    canonical.reconcile."""
+    rows_by_index = {r["row_index"]: r for r in table["rows"]}
+    entries = []
+    for chunk in ts["chunks"].values():
+        entries.extend(chunk.get("entries", []))
+    entries.sort(key=lambda e: e["row_index"])
+
+    records = []
+    records_by_row = {}
+    current_context = ts["context_grouping"]
+    last_record_row = None
+    for entry in entries:
+        ri = entry["row_index"]
+        disp = entry["disposition"]
+        ts["row_dispositions"][str(ri)] = disp
+        if disp == "separator":
+            st = common.fold_ws(entry.get("separator_text", ""))
+            current_context = ts["context_grouping"] + \
+                (" | " + st if st else "")
+            continue
+        if disp == "continuation":
+            if last_record_row is None:
+                ts["row_dispositions"][str(ri)] = "record"
+                rec = canonical.failed_record(
+                    table, rows_by_index[ri], "orphan-continuation")
+                records.append(rec)
+            else:
+                ts["parent_of"][str(ri)] = last_record_row
+                for rec in records_by_row.get(last_record_row, []):
+                    rec["continuation_cells"].append(
+                        {"row_index": ri,
+                         "cells": [str(c)
+                                   for c in rows_by_index[ri]["cells"]]})
+            continue
+        last_record_row = ri
+        for rec_resp in entry["records"]:
+            rec = canonical.build_record(
+                table, rows_by_index[ri], rec_resp["sub_index"],
+                rec_resp["fields"], rec_resp["field_provenance"],
+                rec_resp.get("interpretation_note", ""), current_context,
+                rec_resp.get("company_claim_reading", "none"))
+            records.append(rec)
+            records_by_row.setdefault(ri, []).append(rec)
+    for ri in canonical.reconcile(
+            table, {int(k): v for k, v in ts["row_dispositions"].items()}):
+        ts["row_dispositions"][str(ri)] = "record"
+        records.append(canonical.failed_record(
+            table, rows_by_index[ri], "reconcile-missing"))
+    return records
+
+
+# --------------------------------------------------------------------------
+# resolve — the single state-machine advancer; consumes every response kind
 # --------------------------------------------------------------------------
 
 def cmd_resolve(args):
     run_dir = Path(args.run_dir)
-    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    registry = rules_mod.load_registry(PKG_ROOT / "rules" / "registry.json")
-    doc_type = Path(manifest["company_file"]).suffix.lstrip(".").lower()
-
     skel = json.loads((run_dir / "skeleton.json").read_text(encoding="utf-8"))
     tables_by_index = {t["table_index"]: t for t in skel["tables"]}
     table_state = _read_jsonl_opt(run_dir / "table_state.jsonl")
     tstate_by_index = {t["table_index"]: t for t in table_state}
+    structure_state = _read_jsonl_opt(run_dir / "official_structure_state.jsonl")
+    sstate_by_id = {s["structure_id"]: s for s in structure_state}
     company_records = _read_jsonl_opt(run_dir / "company_records.jsonl")
     records_by_id = {r["record_id"]: r for r in company_records}
-    official_rules = common.read_jsonl(run_dir / "official_rules.jsonl")
-    rules_by_id = {r["rule_id"]: r for r in official_rules}
-
-    match_state = common.read_jsonl(run_dir / "match_state.jsonl")
-    for m in match_state:
-        _ensure_match_fields(m)
+    official_rows = common.read_jsonl(run_dir / "official_rows.jsonl")
+    rows_by_id = {r["official_row_id"]: r for r in official_rows}
+    match_state = [_ensure_match_fields(m) for m in
+                   _read_jsonl_opt(run_dir / "match_state.jsonl")]
     state_by_id = {m["record_id"]: m for m in match_state}
+    scoping_state = _read_jsonl_opt(run_dir / "scoping_state.jsonl")
+    scoping_by_id = {s["scoping_id"]: s for s in scoping_state}
+    rollup_state = _read_jsonl_opt(run_dir / "rollup_state.jsonl")
+    rollup_by_id = {r["rollup_id"]: r for r in rollup_state}
+    validation_state = _read_jsonl_opt(run_dir / "validation_state.jsonl")
+    vstate_by_id = {v["validation_id"]: v for v in validation_state}
+    precedents = _load_precedents()
 
     consumed = _load_consumed(run_dir)
-    consumed_matching = set(consumed["matching"])
+    failures_new = []
+    run_warnings_new = []
+    counts = {}
 
-    matching_requests_all = _read_jsonl_opt(run_dir / "matching_requests.jsonl")
-    validation_failures_new = []
-    new_matching_requests = []
+    def _count(key, n=1):
+        counts[key] = counts.get(key, 0) + n
 
-    # ---- table-mapping pass ---------------------------------------------
-    consumed_mapping = set(consumed["table_mapping"])
-    consumed_canon = set(consumed["canonicalize"])
-    mapping_requests_all = _read_jsonl_opt(
-        run_dir / "table_mapping_requests.jsonl")
-    mapping_req_by_index = {r["table_index"]: r for r in mapping_requests_all}
-    new_mapping_requests = []
-    new_canon_requests = []
-    mapping_ok = mapping_failed_final = 0
-
-    for raw_line in _read_response_lines(
-            run_dir / "table_mapping_responses.jsonl"):
+    def _consume(kind, raw_line):
+        """Returns (resp, errors) — errors is None for a fresh valid parse,
+        "consumed" for an already-consumed replay, or a parse error code."""
         fp = _fingerprint(raw_line)
-        if fp in consumed_mapping:
-            continue
-        consumed_mapping.add(fp)
+        if fp in consumed_sets[kind]:
+            return None, "consumed"
+        consumed_sets[kind].add(fp)
         resp, parse_err = _parse_response_line(raw_line)
         if parse_err:
-            validation_failures_new.append(
-                _mk_failure(None, "table_mapping", [parse_err], raw_line))
+            failures_new.append(_mk_failure(None, kind, [parse_err], raw_line))
+            return None, parse_err
+        return resp, None
+
+    consumed_sets = {k: set(consumed[k]) for k in schema.RESPONSE_KINDS}
+
+    # ---- official structure ------------------------------------------------
+    structure_req_by_id = {r["structure_id"]: r for r in _read_jsonl_opt(
+        run_dir / "official_structure_requests.jsonl")}
+    new_structure_requests = []
+    official_mutated = False
+    for raw_line in _read_response_lines(
+            run_dir / "official_structure_responses.jsonl"):
+        resp, err = _consume("official_structure", raw_line)
+        if resp is None:
+            continue
+        sid = resp.get("structure_id")
+        st = sstate_by_id.get(sid) if isinstance(sid, str) else None
+        req = structure_req_by_id.get(sid) if isinstance(sid, str) else None
+        if st is None or req is None or st["done"]:
+            failures_new.append(_mk_failure(
+                None, "official_structure", ["no-such-request"], resp))
+            continue
+        errs = validate.validate_official_structure_output(
+            resp, req, require_retry=st["failures"] == 1)
+        if errs:
+            st["failures"] += 1
+            failures_new.append(_mk_failure(
+                None, "official_structure", errs, resp))
+            if st["failures"] >= 2:
+                st["done"] = True
+                st["rejected"] = True
+                run_warnings_new.append(
+                    {"code": "structure-rejected",
+                     "detail": st["sheet_or_section"]})
+            else:
+                new_structure_requests.append(dict(
+                    req, retry=True, previous_errors=errs))
+            continue
+        st["done"] = True
+        _count("structure_ok")
+        dic = resp["display_id_column"]
+        for row in official_rows:
+            if row["sheet_or_section"] != st["sheet_or_section"]:
+                continue
+            row["column_roles"] = resp["column_roles"]
+            if dic is not None:
+                row["display_id"] = common.fold_ws(
+                    row["raw_record"].get(dic, "")) or None
+        official_mutated = True
+    if official_mutated:
+        # Duplicate display ids: counting LLM-designated values is
+        # arithmetic, not judgment.
+        seen_display = {}
+        for row in official_rows:
+            did = row.get("display_id")
+            if did:
+                seen_display[did] = seen_display.get(did, 0) + 1
+        for did, n in sorted(seen_display.items()):
+            if n > 1:
+                run_warnings_new.append({"code": "duplicate-display-id",
+                                         "detail": f"{did} appears {n} times"})
+
+    # ---- table mapping -----------------------------------------------------
+    mapping_req_by_index = {r["table_index"]: r for r in _read_jsonl_opt(
+        run_dir / "table_mapping_requests.jsonl")}
+    new_mapping_requests = []
+    new_interp_requests = []
+    for raw_line in _read_response_lines(
+            run_dir / "table_mapping_responses.jsonl"):
+        resp, err = _consume("table_mapping", raw_line)
+        if resp is None:
             continue
         tix = resp.get("table_index")
         ts = tstate_by_index.get(tix) if isinstance(tix, int) else None
         if ts is None or ts["classification"] is not None:
-            validation_failures_new.append(
-                _mk_failure(None, "table_mapping", ["no-such-request"], resp))
+            failures_new.append(_mk_failure(
+                None, "table_mapping", ["no-such-request"], resp))
             continue
         errs = validate.validate_table_mapping_output(
-            resp, tables_by_index[tix])
+            resp, tables_by_index[tix],
+            require_retry=ts["mapping_failures"] == 1)
         if errs:
             ts["mapping_failures"] += 1
-            validation_failures_new.append(
-                _mk_failure(None, "table_mapping", errs, resp))
+            failures_new.append(_mk_failure(None, "table_mapping", errs, resp))
             if ts["mapping_failures"] >= 2:
                 ts["classification"] = "mapping-failed"
-                mapping_failed_final += 1
+                _count("mapping_failed")
             else:
                 new_mapping_requests.append(dict(
                     mapping_req_by_index[tix], retry=True,
                     previous_errors=errs))
             continue
-        mapping_ok += 1
+        _count("mapping_ok")
         ts["classification"] = resp["classification"]
         ts["irrelevant_reason"] = resp["irrelevant_reason"]
         ts["column_mapping"] = resp["column_mapping"]
@@ -522,103 +509,77 @@ def cmd_resolve(args):
                 ts["chunks"][chunk_id] = {
                     "row_indexes": [r["row_index"] for r in chunk],
                     "done": False, "failures": 0, "entries": []}
-                new_canon_requests.append({
+                new_interp_requests.append({
                     "chunk_id": chunk_id, "table_index": tix,
                     "context_grouping": ts["context_grouping"],
                     "column_mapping": ts["column_mapping"],
-                    "header_row": table["header_row"], "rows": chunk,
-                    "instructions_file": "prompts/canonicalize.md"})
+                    "header_row": table["header_row"],
+                    "preceding_narrative": table["preceding_narrative"],
+                    "rows": chunk,
+                    "instructions_file": "prompts/row_interpretation.md"})
 
-    # ---- canonicalize pass ------------------------------------------------
-    canon_req_by_id = {r["chunk_id"]: r for r in
-                       _read_jsonl_opt(run_dir / "canonicalize_requests.jsonl")}
-    canon_ok = canon_failed_final = 0
-    new_records = []
-
+    # ---- row interpretation ------------------------------------------------
     def _chunk_state(chunk_id):
         for ts in table_state:
             if chunk_id in ts.get("chunks", {}):
                 return ts, ts["chunks"][chunk_id]
         return None, None
 
-    def _canon_retry_request(cid, ts, table, chunk):
-        """Look up (or reconstruct) the request to retry for `cid`.
-
-        canon_req_by_id is loaded from canonicalize_requests.jsonl on disk
-        *before* the table-mapping pass above appends newly created chunk
-        requests to new_canon_requests -- those are only persisted to that
-        file at the end of this call (_append_jsonl(..., new_canon_requests)
-        below). So a response answering a chunk created earlier in this same
-        resolve call (chunk ids are predictable, e.g. "T3-C0") has no entry
-        in canon_req_by_id yet. Reconstruct the same request shape from the
-        table/table_state data at hand instead of crashing; return None if
-        that isn't possible so the caller can record the validation failure
-        without issuing a retry, rather than raise.
-        """
-        req = canon_req_by_id.get(cid)
-        if req is not None:
-            return req
+    def _interp_request(cid, ts, table, chunk):
+        rows_by_index = {r["row_index"]: r for r in table["rows"]}
         try:
-            rows_by_index = {r["row_index"]: r for r in table["rows"]}
             rows = [rows_by_index[ri] for ri in chunk["row_indexes"]]
         except KeyError:
             return None
-        return {
-            "chunk_id": cid, "table_index": ts["table_index"],
-            "context_grouping": ts["context_grouping"],
-            "column_mapping": ts["column_mapping"],
-            "header_row": table["header_row"], "rows": rows,
-            "instructions_file": "prompts/canonicalize.md"}
+        return {"chunk_id": cid, "table_index": ts["table_index"],
+                "context_grouping": ts["context_grouping"],
+                "column_mapping": ts["column_mapping"],
+                "header_row": table["header_row"],
+                "preceding_narrative": table["preceding_narrative"],
+                "rows": rows,
+                "instructions_file": "prompts/row_interpretation.md"}
 
+    new_records = []
     for raw_line in _read_response_lines(
-            run_dir / "canonicalize_responses.jsonl"):
-        fp = _fingerprint(raw_line)
-        if fp in consumed_canon:
-            continue
-        consumed_canon.add(fp)
-        resp, parse_err = _parse_response_line(raw_line)
-        if parse_err:
-            validation_failures_new.append(
-                _mk_failure(None, "canonicalize", [parse_err], raw_line))
+            run_dir / "interpretation_responses.jsonl"):
+        resp, err = _consume("interpretation", raw_line)
+        if resp is None:
             continue
         cid = resp.get("chunk_id") if isinstance(resp.get("chunk_id"), str) \
             else None
         ts, chunk = _chunk_state(cid) if cid else (None, None)
         if chunk is None or chunk["done"]:
-            validation_failures_new.append(
-                _mk_failure(None, "canonicalize", ["no-such-request"], resp))
+            failures_new.append(_mk_failure(
+                None, "interpretation", ["no-such-request"], resp))
             continue
         table = tables_by_index[ts["table_index"]]
-        errs = validate.validate_canonicalize_output(
-            resp, table, chunk["row_indexes"])
+        errs = validate.validate_interpretation_output(
+            resp, table, chunk["row_indexes"],
+            require_retry=chunk["failures"] == 1)
         if errs:
             chunk["failures"] += 1
-            validation_failures_new.append(
-                _mk_failure(None, "canonicalize", errs, resp))
+            failures_new.append(_mk_failure(None, "interpretation", errs, resp))
             if chunk["failures"] >= 2:
                 chunk["done"] = True
-                canon_failed_final += 1
+                _count("interpretation_failed")
                 rows_by_index = {r["row_index"]: r for r in table["rows"]}
                 chunk["entries"] = []
                 for ri in chunk["row_indexes"]:
                     ts["row_dispositions"][str(ri)] = "record"
                     new_records.append(canonical.failed_record(
-                        table, rows_by_index[ri], "canonicalize-rejected"))
+                        table, rows_by_index[ri], "interpretation-rejected"))
             else:
-                retry_req = _canon_retry_request(cid, ts, table, chunk)
+                retry_req = _interp_request(cid, ts, table, chunk)
                 if retry_req is not None:
-                    new_canon_requests.append(dict(
+                    new_interp_requests.append(dict(
                         retry_req, retry=True, previous_errors=errs))
-                # else: request could not be found or reconstructed -- the
-                # validation failure above is still recorded; the chunk
-                # simply stays pending instead of crashing the batch.
             continue
-        canon_ok += 1
+        _count("interpretation_ok")
         chunk["done"] = True
         chunk["entries"] = resp["rows"]
 
-    # tables whose chunks all just completed -> build records + shortlists
-    new_matching_requests_from_canon = []
+    # tables whose chunks all just completed -> build records
+    built_records = []
     for ts in table_state:
         chunks = ts.get("chunks", {})
         if not chunks or ts.get("records_built"):
@@ -627,198 +588,433 @@ def cmd_resolve(args):
             table = tables_by_index[ts["table_index"]]
             built = _build_table_records(table, ts)
             ts["records_built"] = True
-            normalize.add_normalized(
-                [r for r in built if r["status"] == "ok"],
-                _COMPANY_NORM_FIELDS)
-            new_records.extend(built)
+            built_records.extend(built)
+    new_records.extend(built_records)
+
+    # ---- match scoping: emit requests for fresh ok records -----------------
+    new_scoping_requests = []
+    official_payload_chunks = _chunk_by_bytes(
+        [payloads.official_row_payload(r) for r in official_rows],
+        schema.SCOPING_OFFICIAL_CHUNK_BYTES)
     if new_records:
         company_records.extend(new_records)
         records_by_id.update({r["record_id"]: r for r in new_records})
-        fresh = [r for r in new_records if r["status"] == "ok"]
-        for m in candidates_mod.generate(fresh, official_rules):
-            m = _ensure_match_fields(m)
-            state_by_id[m["record_id"]] = m
-            if m["tier"] is None and m["candidates"]:
-                new_matching_requests_from_canon.append(_matching_request(
-                    records_by_id[m["record_id"]], m, rules_by_id))
-    match_state = list(state_by_id.values())
+        fresh_ok = [r for r in new_records if r["status"] == "ok"]
+        existing_batches = {s["batch"] for s in scoping_state}
+        next_batch = len(existing_batches)
+        for i in range(0, len(fresh_ok), schema.SCOPING_RECORD_BATCH):
+            batch_records = fresh_ok[i:i + schema.SCOPING_RECORD_BATCH]
+            batch = f"B{next_batch}"
+            next_batch += 1
+            for m_new in batch_records:
+                m = _new_match_state(m_new["record_id"], batch)
+                match_state.append(m)
+                state_by_id[m["record_id"]] = m
+            for k, chunk in enumerate(official_payload_chunks):
+                sid = f"SC-{batch}-K{k}"
+                entry = {"scoping_id": sid, "batch": batch,
+                         "record_ids": [r["record_id"]
+                                        for r in batch_records],
+                         "official_row_ids": [c["official_row_id"]
+                                              for c in chunk],
+                         "done": False, "failures": 0}
+                scoping_state.append(entry)
+                scoping_by_id[sid] = entry
+                new_scoping_requests.append({
+                    "scoping_id": sid,
+                    "records": [payloads.company_record_payload(r)
+                                for r in batch_records],
+                    "official_rows": chunk,
+                    "instructions_file": "prompts/match_scoping.md"})
 
-    # ---- sweep-response pass ----------------------------------------------
-    consumed_sweep = set(consumed["sweep"])
-    sweep_reqs = _read_jsonl_opt(run_dir / "sweep_requests.jsonl")
-    sweep_req_by_id = {r["sweep_id"]: r for r in sweep_reqs}
-    sweep_injected = {}
-    for raw_line in _read_response_lines(run_dir / "sweep_responses.jsonl"):
-        fp = _fingerprint(raw_line)
-        if fp in consumed_sweep:
+    # ---- match scoping: consume responses ----------------------------------
+    scoping_req_by_id = {r["scoping_id"]: r for r in _read_jsonl_opt(
+        run_dir / "scoping_requests.jsonl")}
+    for raw_line in _read_response_lines(run_dir / "scoping_responses.jsonl"):
+        resp, err = _consume("scoping", raw_line)
+        if resp is None:
             continue
-        consumed_sweep.add(fp)
-        resp, parse_err = _parse_response_line(raw_line)
-        if parse_err:
-            validation_failures_new.append(
-                _mk_failure(None, "sweep", [parse_err], raw_line))
+        sid = resp.get("scoping_id")
+        cell = scoping_by_id.get(sid) if isinstance(sid, str) else None
+        if cell is None or cell["done"]:
+            failures_new.append(_mk_failure(
+                None, "scoping", ["no-such-request"], resp))
+            continue
+        errs = validate.validate_scoping_output(
+            resp, set(cell["record_ids"]), set(cell["official_row_ids"]),
+            require_retry=cell["failures"] == 1)
+        if errs:
+            cell["failures"] += 1
+            failures_new.append(_mk_failure(None, "scoping", errs, resp))
+            if cell["failures"] >= 2:
+                cell["done"] = True
+                cell["rejected"] = True
+                _count("scoping_rejected")
+                run_warnings_new.append({"code": "scoping-cell-rejected",
+                                         "detail": sid})
+                for rid in cell["record_ids"]:
+                    if rid in state_by_id:
+                        state_by_id[rid]["scoping_incomplete"] = True
+            else:
+                req = scoping_req_by_id.get(sid)
+                if req is not None:
+                    new_scoping_requests.append(dict(
+                        req, retry=True, previous_errors=errs))
+            continue
+        cell["done"] = True
+        _count("scoping_ok")
+        for n in resp["nominations"]:
+            m = state_by_id.get(n["record_id"])
+            if m is not None and \
+                    n["official_row_id"] not in m["nominations"]:
+                m["nominations"].append(n["official_row_id"])
+
+    # ---- adjudication: emit for records whose scoping batch settled --------
+    new_adjudication_requests = []
+
+    def _adjudication_request(m, extra=None):
+        record = records_by_id[m["record_id"]]
+        req = {"record_id": m["record_id"],
+               "record": payloads.company_record_payload(record),
+               "nominated_rows": [payloads.official_row_payload(rows_by_id[oid])
+                                  for oid in m["nominations"]
+                                  if oid in rows_by_id],
+               "sweep_round": m["sweep_round"],
+               "instructions_file": "prompts/match_adjudication.md"}
+        if extra:
+            req.update(extra)
+        return req
+
+    cells_by_batch = {}
+    for s in scoping_state:
+        cells_by_batch.setdefault(s["batch"], []).append(s)
+    for m in match_state:
+        if m["decision"] is not None or m["adjudication_emitted"] or \
+                m["sweep_round"]:
+            continue
+        cells = cells_by_batch.get(m["scoping_batch"], [])
+        if not cells or not all(c["done"] for c in cells):
+            continue
+        if not m["nominations"]:
+            # Zero nominations across every corpus chunk IS the LLM's
+            # no-match answer; Python only aggregates it.
+            m["decision"] = "none"
+            m["basis"] = "no-nominations"
+            if m["scoping_incomplete"]:
+                m["warnings"].append("scoping-incomplete")
+            _count("no_nominations")
+            continue
+        m["adjudication_emitted"] = True
+        new_adjudication_requests.append(_adjudication_request(m))
+
+    # ---- sweep responses -> reopen + fresh adjudication --------------------
+    sweep_req_by_id = {r["sweep_id"]: r for r in _read_jsonl_opt(
+        run_dir / "sweep_requests.jsonl")}
+    reopened = {}
+    for raw_line in _read_response_lines(run_dir / "sweep_responses.jsonl"):
+        resp, err = _consume("sweep", raw_line)
+        if resp is None:
             continue
         sid = resp.get("sweep_id")
         req = sweep_req_by_id.get(sid) if isinstance(sid, str) else None
         if req is None:
-            validation_failures_new.append(
-                _mk_failure(None, "sweep", ["no-such-request"], resp))
+            failures_new.append(_mk_failure(
+                None, "sweep", ["no-such-request"], resp))
             continue
         batch_ids = {r["record_id"] for r in req["records"]}
-        index_ids = {r["rule_id"] for r in req["rules_index"]}
-        errs = validate.validate_sweep_output(resp, batch_ids, index_ids)
+        official_ids = {r["official_row_id"] for r in req["official_rows"]}
+        errs = validate.validate_sweep_output(resp, batch_ids, official_ids)
         if errs:
-            validation_failures_new.append(
-                _mk_failure(None, "sweep", errs, resp))
+            failures_new.append(_mk_failure(None, "sweep", errs, resp))
             continue
+        _count("sweep_ok")
         for p in resp["proposals"]:
             m = state_by_id.get(p["record_id"])
-            if m is None or m["tier"] not in (None, "T4"):
+            if m is None or m["decision"] not in _SETTLED_NO_MATCH or \
+                    m["sweep_round"]:
                 continue
-            if not any(c["rule_id"] == p["rule_id"]
-                       for c in m["candidates"]):
-                m["candidates"].append({"rule_id": p["rule_id"],
-                                        "score": 0.0,
-                                        "features": {"sweep": 1.0}})
-            if p["rule_id"] not in m["sweep_origin_rule_ids"]:
-                m["sweep_origin_rule_ids"].append(p["rule_id"])
-            m["tier"] = None
-            m["match_failures"] = 0
-            sweep_injected[p["record_id"]] = m
-    for rid, m in sweep_injected.items():
-        new_matching_requests.append(_matching_request(
-            records_by_id[rid], m, rules_by_id,
-            extra={"sweep_round": True}))
-    consumed["sweep"] = sorted(consumed_sweep)
+            if p["official_row_id"] not in m["nominations"]:
+                m["nominations"].append(p["official_row_id"])
+            if p["official_row_id"] not in m["sweep_origin_row_ids"]:
+                m["sweep_origin_row_ids"].append(p["official_row_id"])
+            reopened[p["record_id"]] = m
+    for rid, m in reopened.items():
+        m["decision"] = None
+        m["basis"] = ""
+        m["adjudication_failures"] = 0
+        m["sweep_round"] = True
+        m["adjudication_emitted"] = True
+        new_adjudication_requests.append(_adjudication_request(m))
 
-    # ---- matching pass -----------------------------------------------------
-    requested_ids = {r["record_id"] for r in matching_requests_all}
-    matching_ok = 0
-    matching_rejected_final = 0
-    no_such_request = 0
+    # ---- adjudication responses -------------------------------------------
+    new_comparison_requests = []
 
-    def _pending_ids():
-        return requested_ids & {rid for rid, m in state_by_id.items()
-                                 if m["tier"] is None}
+    def _emit_comparison(m):
+        record = records_by_id[m["record_id"]]
+        selected = [rows_by_id[oid] for oid in m["selected_official_row_ids"]
+                    if oid in rows_by_id]
+        row_payloads = [payloads.official_row_payload(r) for r in selected]
+        base = {"record_id": m["record_id"],
+                "record": payloads.company_record_payload(record),
+                "match_basis": {"basis": m["basis"],
+                                "row_quotes": m["row_quotes"],
+                                "official_quotes": m["official_quotes"]},
+                "sweep_origin_row_ids": m["sweep_origin_row_ids"],
+                "instructions_file": "prompts/comparison.md"}
+        base_size = _psize(base)
+        budget = max(1, schema.COMPARISON_MAX_BYTES - base_size)
+        parts = _chunk_by_bytes(row_payloads, budget) \
+            if _psize(row_payloads) > budget else [row_payloads]
+        split = len(parts) > 1
+        if split:
+            m["warnings"].append("comparison-split")
+            run_warnings_new.append({"code": "comparison-split",
+                                     "detail": m["record_id"]})
+        for i, part in enumerate(parts):
+            cid = f"CMP-{m['record_id']}" + (f"-p{i}" if split else "")
+            precs = []
+            for rp in part:
+                precs.extend(_precedents_for(
+                    precedents, rows_by_id[rp["official_row_id"]]))
+            m["comparison_units"].append(
+                {"comparison_id": cid,
+                 "official_row_ids": [rp["official_row_id"] for rp in part],
+                 "done": False, "failures": 0, "split": split})
+            new_comparison_requests.append(dict(
+                base, comparison_id=cid, official_rows=part,
+                precedents=precs))
 
-    for raw_line in _read_response_lines(run_dir / "matching_responses.jsonl"):
-        fp = _fingerprint(raw_line)
-        if fp in consumed_matching:
-            continue                      # already-consumed replay -> no-op
-        consumed_matching.add(fp)
-
-        resp, parse_err = _parse_response_line(raw_line)
-        if parse_err:
-            validation_failures_new.append(
-                _mk_failure(None, "matching", [parse_err], raw_line))
+    for raw_line in _read_response_lines(
+            run_dir / "adjudication_responses.jsonl"):
+        resp, err = _consume("adjudication", raw_line)
+        if resp is None:
             continue
-
         rid = resp.get("record_id") if isinstance(resp.get("record_id"), str) \
             else None
-        if rid is None or rid not in _pending_ids():
-            no_such_request += 1
-            validation_failures_new.append(
-                _mk_failure(rid, "matching", ["no-such-request"], resp))
+        m = state_by_id.get(rid)
+        if m is None or not m["adjudication_emitted"] or \
+                m["decision"] is not None:
+            failures_new.append(_mk_failure(
+                rid, "adjudication", ["no-such-request"], resp))
             continue
-        m = state_by_id[rid]
-        record = records_by_id.get(rid)
-        bad_types = _type_guard(resp, ["decision", "basis"],
-                                ["selections", "ambiguous_rule_ids"])
-        if bad_types:
-            # A malformed field (wrong type) is invalid Claude output, not a
-            # crash -- it goes through the same retry-then-reject protocol
-            # as any other invalid response, so the two-strike counter still
-            # applies and a genuinely-corrected retry is still requested.
-            errs = ["malformed-response"]
-        else:
-            shortlist_ids = [c["rule_id"] for c in m["candidates"]]
-            errs = validate.validate_match_output(
-                resp, shortlist_ids, record, rules_by_id)
+        errs = validate.validate_adjudication_output(
+            resp, set(m["nominations"]),
+            records_by_id.get(rid, {}), rows_by_id,
+            require_retry=m["adjudication_failures"] == 1,
+            require_sweep_round=m["sweep_round"])
         if errs:
-            m["match_failures"] += 1
-            m["retried"] = True
-            validation_failures_new.append(
-                _mk_failure(rid, "matching", errs, resp))
-            if m["match_failures"] >= 2:
-                matching_rejected_final += 1
-                m["tier"] = "T4"
+            m["adjudication_failures"] += 1
+            failures_new.append(_mk_failure(rid, "adjudication", errs, resp))
+            if m["adjudication_failures"] >= 2:
+                _count("adjudication_rejected")
+                m["decision"] = "unresolved-llm-output-rejected"
                 m["warnings"].append("llm-output-rejected")
             else:
-                new_matching_requests.append(_matching_request(
-                    record, m, rules_by_id,
-                    extra={"retry": True, "previous_errors": errs}))
+                extra = {"retry": True, "previous_errors": errs}
+                if m["sweep_round"]:
+                    extra["sweep_round"] = True
+                new_adjudication_requests.append(
+                    _adjudication_request(m, extra=extra))
             continue
-
+        _count("adjudication_ok")
         decision = resp["decision"]
-        matching_ok += 1
-        if decision == "none":
-            m["tier"] = "T4"
-        elif decision == "ambiguous":
-            m["tier"] = "T3"
-            m["ambiguous_rule_ids"] = resp["ambiguous_rule_ids"]
-        else:  # match
+        m["decision"] = decision
+        m["basis"] = resp["basis"]
+        if decision == "ambiguous":
+            m["ambiguous_official_row_ids"] = resp["ambiguous_official_row_ids"]
+        elif decision == "match":
             sels = resp["selections"]
-            downgraded = False
-            if m.get("margin_flag") and len(sels) == 1 and \
-                    len(m["candidates"]) >= 2:
-                chosen_id = sels[0]["rule_id"]
-                runner_up = next((c for c in m["candidates"]
-                                  if c["rule_id"] != chosen_id), None)
-                if runner_up is not None:
-                    runner_rule = rules_by_id.get(runner_up["rule_id"])
-                    if runner_rule and validate.quote_exists(
-                            sels[0]["rule_quote"], _rule_text(runner_rule)):
-                        downgraded = True
-                        m["tier"] = "T3"
-                        m["ambiguous_rule_ids"] = [chosen_id,
-                                                   runner_up["rule_id"]]
-            if not downgraded:
-                m["tier"] = "T2"
-                m["matched_rule_ids"] = [s["rule_id"] for s in sels]
-                m["row_quotes"] = {s["rule_id"]: s["row_quote"]
-                                   for s in sels}
-                m["rule_quotes"] = {s["rule_id"]: s["rule_quote"]
+            m["selected_official_row_ids"] = [s["official_row_id"]
+                                             for s in sels]
+            m["row_quotes"] = {s["official_row_id"]: s["row_quote"]
+                               for s in sels}
+            m["official_quotes"] = {s["official_row_id"]: s["official_quote"]
                                     for s in sels}
+            _emit_comparison(m)
 
-    # ---- deterministic verdict / semantic hand-off -------------------------
-    new_findings, new_semantic_requests = _run_deterministic_verdicts(
-        registry, doc_type, match_state, records_by_id, rules_by_id)
+    # ---- comparison responses ---------------------------------------------
+    unit_by_cid = {}
+    for m in match_state:
+        for unit in m["comparison_units"]:
+            unit_by_cid[unit["comparison_id"]] = (m, unit)
+    comparison_req_by_id = {r["comparison_id"]: r for r in _read_jsonl_opt(
+        run_dir / "comparison_requests.jsonl")}
+    new_findings = []
+    for raw_line in _read_response_lines(
+            run_dir / "comparison_responses.jsonl"):
+        resp, err = _consume("comparison", raw_line)
+        if resp is None:
+            continue
+        cid = resp.get("comparison_id") \
+            if isinstance(resp.get("comparison_id"), str) else None
+        m, unit = unit_by_cid.get(cid, (None, None))
+        if unit is None or unit["done"]:
+            failures_new.append(_mk_failure(
+                None, "comparison", ["no-such-request"], resp))
+            continue
+        record = records_by_id.get(m["record_id"], {})
+        errs = validate.validate_comparison_output(
+            resp, record, rows_by_id, unit["official_row_ids"],
+            require_retry=unit["failures"] == 1)
+        if errs:
+            unit["failures"] += 1
+            failures_new.append(_mk_failure(
+                m["record_id"], "comparison", errs, resp))
+            if unit["failures"] >= 2:
+                unit["done"] = True
+                unit["rejected"] = True
+                _count("comparison_rejected")
+                m["warnings"].append("llm-output-rejected")
+            else:
+                req = comparison_req_by_id.get(cid)
+                if req is not None:
+                    new_comparison_requests.append(dict(
+                        req, retry=True, previous_errors=errs))
+            continue
+        unit["done"] = True
+        _count("comparison_ok")
+        m["claim_consistency"] = resp["claim_consistency"]
+        m["record_notes"] = resp["record_notes"]
+        for entry in resp["per_rule"]:
+            official_row = rows_by_id[entry["official_row_id"]]
+            new_findings.append(_build_finding(
+                record, m, official_row, entry, resp["claim_consistency"],
+                resp["record_notes"], unit["split"]))
 
-    # ---- persist -------------------------------------------------------
-    common.write_jsonl(run_dir / "match_state.jsonl", match_state)
+    # ---- rollup responses --------------------------------------------------
+    rollup_req_by_id = {r["rollup_id"]: r for r in _read_jsonl_opt(
+        run_dir / "rollup_requests.jsonl")}
+    new_rollup_requests = []
+    for raw_line in _read_response_lines(run_dir / "rollup_responses.jsonl"):
+        resp, err = _consume("rollup", raw_line)
+        if resp is None:
+            continue
+        rup_id = resp.get("rollup_id") \
+            if isinstance(resp.get("rollup_id"), str) else None
+        entry = rollup_by_id.get(rup_id)
+        if entry is None or entry["done"]:
+            failures_new.append(_mk_failure(
+                None, "rollup", ["no-such-request"], resp))
+            continue
+        errs = validate.validate_rollup_output(
+            resp, entry["record_ids"], require_retry=entry["failures"] == 1)
+        if errs:
+            entry["failures"] += 1
+            failures_new.append(_mk_failure(None, "rollup", errs, resp))
+            if entry["failures"] >= 2:
+                entry["done"] = True
+                entry["rejected"] = True
+                _count("rollup_rejected")
+            else:
+                req = rollup_req_by_id.get(rup_id)
+                if req is not None:
+                    new_rollup_requests.append(dict(
+                        req, retry=True, previous_errors=errs))
+            continue
+        entry["done"] = True
+        _count("rollup_ok")
+        entry["result"] = {
+            "joint_verdict": resp["joint_verdict"],
+            "coverage_of_requirement": resp["coverage_of_requirement"],
+            "reasoning": resp["reasoning"],
+            "confidence": resp["confidence"],
+            "human_review": resp["human_review"]}
+
+    # ---- validation responses ---------------------------------------------
+    validation_req_by_id = {r["validation_id"]: r for r in _read_jsonl_opt(
+        run_dir / "validation_requests.jsonl")}
+    new_validation_requests = []
+    for raw_line in _read_response_lines(
+            run_dir / "validation_responses.jsonl"):
+        resp, err = _consume("validation", raw_line)
+        if resp is None:
+            continue
+        vid = resp.get("validation_id") \
+            if isinstance(resp.get("validation_id"), str) else None
+        entry = vstate_by_id.get(vid)
+        req = validation_req_by_id.get(vid)
+        if entry is None or req is None or entry["done"]:
+            failures_new.append(_mk_failure(
+                None, "validation", ["no-such-request"], resp))
+            continue
+        req_records = req.get("records") or [req.get("record")] or []
+        evidence_source = " ".join(
+            [validate.company_quote_source(r) for r in req_records if r] +
+            [validate.official_quote_source(r)
+             for r in req.get("official_rows", [])])
+        errs = validate.validate_validation_output(
+            resp, req["claimed"]["verdict"], evidence_source,
+            require_retry=entry["failures"] == 1)
+        if errs or resp.get("finding_id") != entry["finding_id"]:
+            errs = errs or ["wrong-finding-id"]
+            entry["failures"] += 1
+            failures_new.append(_mk_failure(None, "validation", errs, resp))
+            if entry["failures"] >= 2:
+                entry["done"] = True
+                entry["rejected"] = True
+                _count("validation_rejected")
+            else:
+                new_validation_requests.append(dict(
+                    req, retry=True, previous_errors=errs))
+            continue
+        entry["done"] = True
+        _count("validation_ok")
+        entry["result"] = {
+            "outcome": resp["outcome"],
+            "independent_verdict": resp["independent_verdict"],
+            "revised_verdict": resp["revised_verdict"],
+            "revised_change_analysis": resp["revised_change_analysis"],
+            "reason": resp["reason"],
+            "evidence_quote": resp["evidence_quote"]}
+
+    # ---- persist -----------------------------------------------------------
+    common.write_jsonl(run_dir / "official_rows.jsonl", official_rows)
+    common.write_jsonl(run_dir / "official_structure_state.jsonl",
+                       structure_state)
     common.write_jsonl(run_dir / "table_state.jsonl", table_state)
     common.write_jsonl(run_dir / "company_records.jsonl", company_records)
+    common.write_jsonl(run_dir / "match_state.jsonl", match_state)
+    common.write_jsonl(run_dir / "scoping_state.jsonl", scoping_state)
+    common.write_jsonl(run_dir / "rollup_state.jsonl", rollup_state)
+    common.write_jsonl(run_dir / "validation_state.jsonl", validation_state)
+    _append_jsonl(run_dir / "official_structure_requests.jsonl",
+                  new_structure_requests)
     _append_jsonl(run_dir / "table_mapping_requests.jsonl",
                   new_mapping_requests)
-    _append_jsonl(run_dir / "canonicalize_requests.jsonl", new_canon_requests)
-    _append_jsonl(run_dir / "matching_requests.jsonl",
-                 new_matching_requests + new_matching_requests_from_canon)
-    _append_jsonl(run_dir / "validation_failures.jsonl", validation_failures_new)
+    _append_jsonl(run_dir / "interpretation_requests.jsonl",
+                  new_interp_requests)
+    _append_jsonl(run_dir / "scoping_requests.jsonl", new_scoping_requests)
+    _append_jsonl(run_dir / "adjudication_requests.jsonl",
+                  new_adjudication_requests)
+    _append_jsonl(run_dir / "comparison_requests.jsonl",
+                  new_comparison_requests)
+    _append_jsonl(run_dir / "rollup_requests.jsonl", new_rollup_requests)
+    _append_jsonl(run_dir / "validation_requests.jsonl",
+                  new_validation_requests)
     _append_jsonl(run_dir / "findings.jsonl", new_findings)
-    _append_jsonl(run_dir / "semantic_requests.jsonl", new_semantic_requests)
-    consumed["table_mapping"] = sorted(consumed_mapping)
-    consumed["canonicalize"] = sorted(consumed_canon)
-    consumed["matching"] = sorted(consumed_matching)
+    _append_jsonl(run_dir / "validation_failures.jsonl", failures_new)
+    _append_jsonl(run_dir / "run_warnings.jsonl", run_warnings_new)
+    for k in schema.RESPONSE_KINDS:
+        consumed[k] = sorted(consumed_sets[k])
     _save_consumed(run_dir, consumed)
 
-    retries_pending = sum(1 for m in match_state
-                          if m["tier"] is None and m["match_failures"] == 1)
-    semantic_pending_total = len(_read_jsonl_opt(run_dir / "semantic_requests.jsonl"))
-    canon_pending = sum(1 for ts in table_state
-                        for c in ts.get("chunks", {}).values()
-                        if not c["done"])
-    print(f"resolve: mapping_ok={mapping_ok} "
-          f"mapping_failed={mapping_failed_final} canon_ok={canon_ok} "
-          f"canon_failed={canon_failed_final} canon_pending={canon_pending} "
-          f"matching_ok={matching_ok} "
-          f"matching_rejected_final={matching_rejected_final} "
-          f"no_such_request={no_such_request} retries_pending={retries_pending} "
-          f"new_findings={len(new_findings)} semantic_pending={semantic_pending_total}")
+    pending_adjudication = sum(
+        1 for m in match_state
+        if m["adjudication_emitted"] and m["decision"] is None)
+    pending_scoping = sum(1 for s in scoping_state if not s["done"])
+    pending_comparison = sum(
+        1 for m in match_state for u in m["comparison_units"]
+        if not u["done"])
+    summary = " ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    print(f"resolve: {summary} pending_scoping={pending_scoping} "
+          f"pending_adjudication={pending_adjudication} "
+          f"pending_comparison={pending_comparison} "
+          f"new_findings={len(new_findings)}")
     return 0
 
 
 # --------------------------------------------------------------------------
-# sweep
+# sweep — one-shot reverse recall barrier
 # --------------------------------------------------------------------------
 
 def cmd_sweep(args):
@@ -829,41 +1025,45 @@ def cmd_sweep(args):
         return 0
     company_records = _read_jsonl_opt(run_dir / "company_records.jsonl")
     records_by_id = {r["record_id"]: r for r in company_records}
-    official_rules = common.read_jsonl(run_dir / "official_rules.jsonl")
+    official_rows = common.read_jsonl(run_dir / "official_rows.jsonl")
+    scoping_state = _read_jsonl_opt(run_dir / "scoping_state.jsonl")
     match_state = [_ensure_match_fields(m) for m in
                    _read_jsonl_opt(run_dir / "match_state.jsonl")]
 
+    pending = sum(1 for s in scoping_state if not s["done"]) + \
+        sum(1 for m in match_state if m["decision"] is None)
+    if pending:
+        print(f"sweep: not-ready pending={pending}")
+        return 4
+
     matched_ids = set()
     for m in match_state:
-        if m["tier"] in _MATCHED_TIERS:
-            matched_ids.update(m["matched_rule_ids"])
+        if m["decision"] == "match":
+            matched_ids.update(m["selected_official_row_ids"])
     unmatched = [records_by_id[m["record_id"]] for m in match_state
-                 if m["tier"] in (None, "T4")
+                 if m["decision"] in _SETTLED_NO_MATCH
                  and records_by_id.get(m["record_id"], {}).get("status") == "ok"]
-    unaddressed = [r for r in official_rules
-                   if r["rule_id"] not in matched_ids]
+    unaddressed = [r for r in official_rows
+                   if r["official_row_id"] not in matched_ids]
     if not unmatched or not unaddressed:
         state_path.write_text(json.dumps({"done": True, "batches": 0},
                                          indent=1), encoding="utf-8")
         print("sweep: nothing-to-sweep")
         return 0
 
-    index = [{"rule_id": r["rule_id"], "title": r.get("title", ""),
-              "expected_value": r.get("expected_value", ""),
-              "tech_tokens": sorted(candidates_mod.technical_tokens(
-                  _rule_text(r)))[:8]}
-             for r in unaddressed]
+    official_chunks = _chunk_by_bytes(
+        [payloads.official_row_payload(r) for r in unaddressed],
+        schema.SCOPING_OFFICIAL_CHUNK_BYTES)
     requests = []
-    for bi, start in enumerate(range(0, len(unmatched), 20)):
-        batch = unmatched[start:start + 20]
-        requests.append({
-            "sweep_id": f"S{bi}",
-            "records": [{"record_id": r["record_id"],
-                         "context_grouping": r["context_grouping"],
-                         **{f: r[f] for f in canonical.CANONICAL_DATA_FIELDS}}
-                        for r in batch],
-            "rules_index": index,
-            "instructions_file": "prompts/sweep.md"})
+    for bi in range(0, len(unmatched), schema.SWEEP_RECORD_BATCH):
+        batch = unmatched[bi:bi + schema.SWEEP_RECORD_BATCH]
+        for k, chunk in enumerate(official_chunks):
+            requests.append({
+                "sweep_id": f"SW-B{bi // schema.SWEEP_RECORD_BATCH}-K{k}",
+                "records": [payloads.company_record_payload(r)
+                            for r in batch],
+                "official_rows": chunk,
+                "instructions_file": "prompts/sweep.md"})
     common.write_jsonl(run_dir / "sweep_requests.jsonl", requests)
     state_path.write_text(json.dumps({"done": True,
                                       "batches": len(requests)}, indent=1),
@@ -874,422 +1074,472 @@ def cmd_sweep(args):
 
 
 # --------------------------------------------------------------------------
-# finalize
+# rollup — one-shot joint-assessment barrier (1:N requirement)
 # --------------------------------------------------------------------------
 
-def _ignored_row_ids(registry, company_records, doc_type):
-    ignored = set()
-    for row in company_records:
-        context = _context_for_row(row, doc_type, field="")
-        applied, _ = rules_mod.applicable_rules(registry, context)
-        if any(r["category"] == "ignore-field" and
-               r["scope"]["level"] == "sheet-or-section" for r in applied):
-            ignored.add(row["record_id"])
-    return ignored
+def cmd_rollup(args):
+    run_dir = Path(args.run_dir)
+    marker_path = run_dir / "rollup_marker.json"
+    if marker_path.exists():
+        print("rollup: already-done")
+        return 0
+    if not (run_dir / "sweep_state.json").exists():
+        print("rollup: not-ready (sweep not run)")
+        return 4
+    company_records = _read_jsonl_opt(run_dir / "company_records.jsonl")
+    records_by_id = {r["record_id"]: r for r in company_records}
+    official_rows = common.read_jsonl(run_dir / "official_rows.jsonl")
+    rows_by_id = {r["official_row_id"]: r for r in official_rows}
+    match_state = [_ensure_match_fields(m) for m in
+                   _read_jsonl_opt(run_dir / "match_state.jsonl")]
+    findings = _read_jsonl_opt(run_dir / "findings.jsonl")
+
+    pending = sum(1 for m in match_state if m["decision"] is None) + \
+        sum(1 for m in match_state for u in m["comparison_units"]
+            if not u["done"])
+    if pending:
+        print(f"rollup: not-ready pending={pending}")
+        return 4
+
+    findings_by_pair = {(f["record_id"], f["official_row_id"]): f
+                        for f in findings}
+    matchers = {}
+    for m in match_state:
+        if m["decision"] == "match":
+            for oid in m["selected_official_row_ids"]:
+                matchers.setdefault(oid, []).append(m["record_id"])
+
+    rollup_state, requests = [], []
+    for oid, rids in sorted(matchers.items()):
+        contributors = [rid for rid in rids
+                        if (rid, oid) in findings_by_pair]
+        if len(contributors) < 2 or oid not in rows_by_id:
+            continue
+        rup_id = common.rollup_id(oid)
+        req = {"rollup_id": rup_id,
+               "official_row": payloads.official_row_payload(rows_by_id[oid]),
+               "company_records": [payloads.company_record_payload(
+                   records_by_id[rid]) for rid in contributors],
+               "per_record_findings": [
+                   {"record_id": rid,
+                    "verdict": findings_by_pair[(rid, oid)]["verdict"],
+                    "change_analysis":
+                        findings_by_pair[(rid, oid)]["change_analysis"],
+                    "reasoning": findings_by_pair[(rid, oid)]["reasoning"],
+                    "row_quote": findings_by_pair[(rid, oid)]["row_quote"],
+                    "official_quote":
+                        findings_by_pair[(rid, oid)]["official_quote"]}
+                   for rid in contributors],
+               "instructions_file": "prompts/rule_rollup.md"}
+        oversized = _psize(req) > schema.ROLLUP_MAX_BYTES
+        rollup_state.append({"rollup_id": rup_id, "official_row_id": oid,
+                             "record_ids": contributors,
+                             "oversized": oversized,
+                             "done": False, "failures": 0})
+        requests.append(req)
+    common.write_jsonl(run_dir / "rollup_state.jsonl", rollup_state)
+    common.write_jsonl(run_dir / "rollup_requests.jsonl", requests)
+    marker_path.write_text(json.dumps({"done": True,
+                                       "groups": len(requests)}, indent=1),
+                           encoding="utf-8")
+    print(f"rollup: groups={len(requests)}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# finalize — gate, validation dispatch, merge, coverage, report
+# --------------------------------------------------------------------------
+
+def _validation_request_for_finding(f):
+    return {"validation_id": "VAL-" + f["finding_id"],
+            "finding_id": f["finding_id"],
+            "kind": "comparison",
+            "record": f["company_row"],
+            "official_rows": [f["official_row"]],
+            "claimed": {"verdict": f["verdict"],
+                        "change_analysis": f["change_analysis"],
+                        "field_alignment": f["field_alignment"],
+                        "match_rationale": f["match_rationale"],
+                        "semantic_differences": f["semantic_differences"],
+                        "reasoning": f["reasoning"],
+                        "confidence": f["confidence"],
+                        "human_review": f["human_review"],
+                        "row_quote": f["row_quote"],
+                        "official_quote": f["official_quote"],
+                        "match_basis": f["match_basis"]},
+            "instructions_file": "prompts/validation.md"}
+
+
+def _validation_request_for_rollup(entry, records_by_id, rows_by_id):
+    result = entry["result"]
+    return {"validation_id": "VAL-" + entry["rollup_id"],
+            "finding_id": entry["rollup_id"],
+            "kind": "rollup",
+            "records": [payloads.company_record_payload(records_by_id[rid])
+                        for rid in entry["record_ids"]
+                        if rid in records_by_id],
+            "official_rows": [payloads.official_row_payload(
+                rows_by_id[entry["official_row_id"]])]
+            if entry["official_row_id"] in rows_by_id else [],
+            "claimed": {"verdict": result["joint_verdict"],
+                        "coverage_of_requirement":
+                            result["coverage_of_requirement"],
+                        "reasoning": result["reasoning"],
+                        "confidence": result["confidence"],
+                        "human_review": result["human_review"]},
+            "instructions_file": "prompts/validation.md"}
+
+
+def _merge_validation(target, ventry):
+    """Copy the validator's decision onto a finding/rollup. Every branch
+    routes on an enum the LLM chose."""
+    if ventry is None:
+        target["validation"] = {"status": "validation-not-run"}
+        return
+    if ventry.get("rejected") or "result" not in ventry:
+        target["validation"] = {"status": "llm-output-rejected"}
+        return
+    r = ventry["result"]
+    target["validation"] = {
+        "outcome": r["outcome"],
+        "independent_verdict": r["independent_verdict"],
+        "revised_verdict": r["revised_verdict"],
+        "reason": r["reason"],
+        "evidence_quote": r["evidence_quote"]}
+    if r["outcome"] == "refuted":
+        target["disputed"] = True
+    elif r["outcome"] == "revised":
+        target["first_pass_verdict"] = target["verdict"]
+        target["verdict"] = r["revised_verdict"]
+        target["verdict_source"] = "validation-revised"
+        if r["revised_change_analysis"] is not None and \
+                "change_analysis" in target:
+            target["change_analysis"] = r["revised_change_analysis"]
+
+
+_VALIDATION_REVIEW_REASONS = {
+    "refuted": "validation-refuted",
+    "revised": "validation-revised",
+    "needs-human": "validation-needs-human"}
 
 
 def cmd_finalize(args):
     run_dir = Path(args.run_dir)
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    registry = rules_mod.load_registry(PKG_ROOT / "rules" / "registry.json")
-    doc_type = Path(manifest["company_file"]).suffix.lstrip(".").lower()
-
     skel = json.loads((run_dir / "skeleton.json").read_text(encoding="utf-8"))
     table_state = _read_jsonl_opt(run_dir / "table_state.jsonl")
     tstate_by_index = {t["table_index"]: t for t in table_state}
     tables_by_index = {t["table_index"]: t for t in skel["tables"]}
+    structure_state = _read_jsonl_opt(run_dir / "official_structure_state.jsonl")
     company_records = _read_jsonl_opt(run_dir / "company_records.jsonl")
     records_by_id = {r["record_id"]: r for r in company_records}
-    official_rules = common.read_jsonl(run_dir / "official_rules.jsonl")
-    rules_by_id = {r["rule_id"]: r for r in official_rules}
-
-    match_state = common.read_jsonl(run_dir / "match_state.jsonl")
-    for m in match_state:
-        _ensure_match_fields(m)
+    official_rows = common.read_jsonl(run_dir / "official_rows.jsonl")
+    rows_by_id = {r["official_row_id"]: r for r in official_rows}
+    match_state = [_ensure_match_fields(m) for m in
+                   _read_jsonl_opt(run_dir / "match_state.jsonl")]
     state_by_id = {m["record_id"]: m for m in match_state}
+    scoping_state = _read_jsonl_opt(run_dir / "scoping_state.jsonl")
+    rollup_state = _read_jsonl_opt(run_dir / "rollup_state.jsonl")
+    validation_state = _read_jsonl_opt(run_dir / "validation_state.jsonl")
+    vstate_by_id = {v["validation_id"]: v for v in validation_state}
+    findings = _read_jsonl_opt(run_dir / "findings.jsonl")
 
-    # ---- deterministic verdict / semantic hand-off -------------------------
-    # Closes the gap where a record was matched (e.g. a T0/T1 raw-text match
-    # already assigned during `start`) but `resolve` was never called before
-    # `finalize`: without this, a matched record could reach final.json with
-    # no corresponding finding and no warning. Idempotent (guarded by each
-    # match_state record's verdict_done_rules) so calling this on every
-    # `finalize` -- even after `resolve` already ran it -- is a safe no-op
-    # for pairs already processed.
-    verdict_findings_new, verdict_semantic_requests_new = _run_deterministic_verdicts(
-        registry, doc_type, match_state, records_by_id, rules_by_id)
-
-    consumed = _load_consumed(run_dir)
-    consumed_semantic = set(consumed["semantic"])
-
-    validation_failures = _read_jsonl_opt(run_dir / "validation_failures.jsonl")
-    new_validation_failures = []
-
-    # ---- pending table-mapping / canonicalize chunks -----------------------
+    # ---- pending inventory -------------------------------------------------
+    pending_structure = [s["structure_id"] for s in structure_state
+                         if not s["done"]]
     pending_tables = [t["table_index"] for t in table_state
                       if t["classification"] is None]
     pending_chunks = [(t["table_index"], cid)
                       for t in table_state
                       for cid, c in t.get("chunks", {}).items()
                       if not c["done"]]
+    pending_scoping = [s["scoping_id"] for s in scoping_state
+                       if not s["done"]]
+    pending_matching = [m["record_id"] for m in match_state
+                        if m["decision"] is None]
+    pending_comparison = [u["comparison_id"]
+                          for m in match_state
+                          for u in m["comparison_units"] if not u["done"]]
+    rollup_run = (run_dir / "rollup_marker.json").exists()
+    pending_rollup = [] if not rollup_run else \
+        [r["rollup_id"] for r in rollup_state if not r["done"]]
+    rollup_missing = not rollup_run
 
-    # ---- pending matching records ------------------------------------------
-    matching_requests_all = _read_jsonl_opt(run_dir / "matching_requests.jsonl")
-    matching_requested_ids = {r["record_id"] for r in matching_requests_all}
-    pending_matching_ids = sorted(
-        rid for rid in matching_requested_ids
-        if state_by_id.get(rid, {}).get("tier") is None)
-
-    # ---- semantic responses -------------------------------------------
-    semantic_requests_all = (_read_jsonl_opt(run_dir / "semantic_requests.jsonl")
-                             + verdict_semantic_requests_new)
-    semantic_pairs = {(r["record_id"], r["rule_id"]) for r in semantic_requests_all}
-    resolved_pairs = set()
-    semantic_findings = []
-    new_semantic_requests = []
-
-    for raw_line in _read_response_lines(run_dir / "semantic_responses.jsonl"):
-        fp = _fingerprint(raw_line)
-        # Unlike matching (where a resolved pair's tier is persisted on
-        # match_state and never re-derived from *_responses.jsonl), a
-        # semantic pair's resolution has no persisted marker other than
-        # "this pair is missing from pending_semantic_pairs" -- which is
-        # itself recomputed from semantic_requests.jsonl (never pruned) on
-        # every call. So an already-consumed *valid* line MUST still be
-        # reprocessed every call (same principle as the skeptic merge below)
-        # to keep rebuilding resolved_pairs/semantic_findings, or a second
-        # `finalize` call (e.g. to layer in skeptic results) would silently
-        # see the pair as freshly pending again and either refuse or
-        # overwrite the real finding with a semantic-pass-not-run stand-in.
-        # Only the retry-counter bump and the validation-failure record for
-        # a *bad* line must stay one-shot, guarded by `is_new` below.
-        is_new = fp not in consumed_semantic
-        if is_new:
-            consumed_semantic.add(fp)
-
-        resp, parse_err = _parse_response_line(raw_line)
-        if parse_err:
-            if is_new:
-                new_validation_failures.append(
-                    _mk_failure(None, "semantic", [parse_err], raw_line,
-                               rule_id=None))
-            continue
-
-        rid = resp.get("record_id") if isinstance(resp.get("record_id"), str) \
-            else None
-        ruleid = resp.get("rule_id") if isinstance(resp.get("rule_id"), str) \
-            else None
-
-        pair = (rid, ruleid)
-        if pair not in semantic_pairs or pair in resolved_pairs:
-            if is_new:
-                new_validation_failures.append(
-                    _mk_failure(rid, "semantic", ["no-such-request"], resp,
-                               rule_id=ruleid))
-            continue
-        record = records_by_id.get(rid)
-        rule = rules_by_id.get(ruleid)
-        m = state_by_id.get(rid)
-        if record is None or rule is None or m is None:
-            if is_new:
-                new_validation_failures.append(
-                    _mk_failure(rid, "semantic", ["no-such-request"], resp,
-                               rule_id=ruleid))
-            resolved_pairs.add(pair)
-            continue
-        bad_types = _type_guard(
-            resp, ["finding_type", "verdict", "row_quote", "rule_quote",
-                   "interpretation"])
-        if bad_types:
-            # Same reasoning as the matching pass: a malformed field is
-            # invalid output, not a crash, and goes through the same
-            # two-strike retry-then-reject protocol.
-            errs = ["malformed-response"]
-        else:
-            errs = validate.validate_semantic_output(resp, record, rule)
-        if errs:
-            if is_new:
-                n = m["semantic_failures"].get(ruleid, 0) + 1
-                m["semantic_failures"][ruleid] = n
-                m["retried"] = True
-                new_validation_failures.append(
-                    _mk_failure(rid, "semantic", errs, resp, rule_id=ruleid))
-                if n < 2:
-                    new_semantic_requests.append(
-                        {"record_id": rid, "rule_id": ruleid,
-                         "record": record, "rule": rule,
-                         "instructions_file": "prompts/semantic_compare.md",
-                         "retry": True, "previous_errors": errs})
-            if m["semantic_failures"].get(ruleid, 0) >= 2:
-                resolved_pairs.add(pair)
-                semantic_findings.append(_build_finding(
-                    rid, record["row_id"], ruleid, "Cannot Assess",
-                    "llm-output-rejected", False, None, None, None, [], m,
-                    record, rule))
-            continue
-
-        resolved_pairs.add(pair)
-        semantic_findings.append(_build_finding(
-            rid, record["row_id"], ruleid, resp["verdict"],
-            "semantic-comparison", False,
-            resp["finding_type"], {"row_quote": resp.get("row_quote"),
-                                    "rule_quote": resp.get("rule_quote")},
-            resp.get("interpretation"), [], m, record, rule))
-
-    pending_semantic_pairs = sorted(semantic_pairs - resolved_pairs)
-
-    # Persist the bookkeeping from this call's semantic-response processing
-    # (retry counters, requeued requests, validation failures, consumed
-    # fingerprints) *before* any early return below. A refusal or coverage-
-    # abort must not silently discard work already done, or the two-strike
-    # retry counter would never advance across repeated `finalize` calls.
-    # This also persists this call's deterministic-verdict pass (new
-    # findings + any semantic hand-off it produced, plus the
-    # verdict_done_rules / warnings mutations already carried on
-    # state_by_id's match_state
-    # records) for the same reason -- a refusal must not throw that work
-    # away, or it would be silently recomputed (or silently lost, if
-    # verdict_done_rules already flipped True) on the next call. table_state
-    # / company_records are round-tripped here too so any allow-pending
-    # mutations further below always write from a consistent base and so a
-    # refusal never silently discards bookkeeping.
-    common.write_jsonl(run_dir / "match_state.jsonl", list(state_by_id.values()))
-    common.write_jsonl(run_dir / "table_state.jsonl", table_state)
-    common.write_jsonl(run_dir / "company_records.jsonl", company_records)
-    _append_jsonl(run_dir / "validation_failures.jsonl", new_validation_failures)
-    _append_jsonl(run_dir / "findings.jsonl", verdict_findings_new)
-    _append_jsonl(run_dir / "semantic_requests.jsonl",
-                 new_semantic_requests + verdict_semantic_requests_new)
-    consumed["semantic"] = sorted(consumed_semantic)
-    _save_consumed(run_dir, consumed)
-
-    # ---- refusal gate -------------------------------------------------
-    if (pending_tables or pending_chunks or pending_matching_ids or
-            pending_semantic_pairs) and not args.allow_pending:
+    blocking = (pending_tables or pending_chunks or pending_scoping or
+                pending_matching or pending_comparison or pending_rollup or
+                rollup_missing)
+    if blocking and not args.allow_pending:
         print(f"finalize: refused - pending mapping={len(pending_tables)} "
-              f"pending canonicalize={len(pending_chunks)} "
-              f"pending matching={len(pending_matching_ids)} "
-              f"pending semantic={len(pending_semantic_pairs)} "
+              f"interpretation={len(pending_chunks)} "
+              f"scoping={len(pending_scoping)} "
+              f"matching={len(pending_matching)} "
+              f"comparison={len(pending_comparison)} "
+              f"rollup={'not-run' if rollup_missing else len(pending_rollup)} "
               f"(use --allow-pending to force)")
         return 4
 
-    passnotrun_findings = []
+    run_warnings_new = []
+    # ---- allow-pending settlements (pipeline statuses, never verdicts) ----
     if args.allow_pending:
+        for sid in pending_structure:
+            run_warnings_new.append({"code": "structure-pass-not-run",
+                                     "detail": sid})
         for tix in pending_tables:
             tstate_by_index[tix]["classification"] = "mapping-pass-not-run"
         for tix, cid in pending_chunks:
             ts = tstate_by_index[tix]
             chunk = ts["chunks"][cid]
             chunk["done"] = True
+            chunk["not_run"] = True
             table = tables_by_index[tix]
             rows_by_index = {r["row_index"]: r for r in table["rows"]}
             for ri in chunk["row_indexes"]:
                 if str(ri) not in ts["row_dispositions"]:
                     ts["row_dispositions"][str(ri)] = "record"
                     rec = canonical.failed_record(
-                        table, rows_by_index[ri], "canonicalize-pass-not-run")
+                        table, rows_by_index[ri],
+                        "interpretation-pass-not-run")
                     company_records.append(rec)
                     records_by_id[rec["record_id"]] = rec
-        for rid in pending_matching_ids:
+        for s in scoping_state:
+            if not s["done"]:
+                s["done"] = True
+                s["not_run"] = True
+                for rid in s["record_ids"]:
+                    if rid in state_by_id:
+                        state_by_id[rid]["scoping_incomplete"] = True
+                        if "scoping-pass-not-run" not in \
+                                state_by_id[rid]["warnings"]:
+                            state_by_id[rid]["warnings"].append(
+                                "scoping-pass-not-run")
+        for rid in pending_matching:
             m = state_by_id.get(rid)
-            if m is None:
-                continue
-            m["tier"] = "T4"
-            if "matching-pass-not-run" not in m["warnings"]:
-                m["warnings"].append("matching-pass-not-run")
-        for rid, ruleid in pending_semantic_pairs:
-            m = state_by_id.get(rid)
-            record = records_by_id.get(rid)
-            rule = rules_by_id.get(ruleid)
-            if m is None or record is None or rule is None:
-                continue
-            f = _build_finding(rid, record["row_id"], ruleid, "Cannot Assess",
-                                "semantic-pass-not-run", False, None, None,
-                                None, [], m, record, rule)
-            f["human_review_needed"] = True
-            passnotrun_findings.append(f)
+            if m is not None and m["decision"] is None and \
+                    "adjudication-pass-not-run" not in m["warnings"] and \
+                    m["adjudication_emitted"]:
+                m["warnings"].append("adjudication-pass-not-run")
+        for m in match_state:
+            for u in m["comparison_units"]:
+                if not u["done"]:
+                    u["done"] = True
+                    u["not_run"] = True
+        if rollup_missing:
+            run_warnings_new.append({"code": "rollup-pass-not-run",
+                                     "detail": ""})
+        for r in rollup_state:
+            if not r["done"]:
+                r["done"] = True
+                r["not_run"] = True
 
-    match_state = list(state_by_id.values())
+    # ---- validation dispatch ----------------------------------------------
+    new_validation_requests = []
+    if not args.allow_pending:
+        for f in findings:
+            vid = "VAL-" + f["finding_id"]
+            if vid not in vstate_by_id:
+                entry = {"validation_id": vid,
+                         "finding_id": f["finding_id"],
+                         "done": False, "failures": 0}
+                validation_state.append(entry)
+                vstate_by_id[vid] = entry
+                new_validation_requests.append(
+                    _validation_request_for_finding(f))
+        for r in rollup_state:
+            if r.get("done") and "result" in r:
+                vid = "VAL-" + r["rollup_id"]
+                if vid not in vstate_by_id:
+                    entry = {"validation_id": vid,
+                             "finding_id": r["rollup_id"],
+                             "done": False, "failures": 0}
+                    validation_state.append(entry)
+                    vstate_by_id[vid] = entry
+                    new_validation_requests.append(
+                        _validation_request_for_rollup(
+                            r, records_by_id, rows_by_id))
 
-    # ---- deterministic findings recorded during resolve --------------
-    det_findings = _read_jsonl_opt(run_dir / "findings.jsonl")
+    # ---- persist bookkeeping before any refusal ---------------------------
+    common.write_jsonl(run_dir / "table_state.jsonl", table_state)
+    common.write_jsonl(run_dir / "company_records.jsonl", company_records)
+    common.write_jsonl(run_dir / "match_state.jsonl", match_state)
+    common.write_jsonl(run_dir / "scoping_state.jsonl", scoping_state)
+    common.write_jsonl(run_dir / "rollup_state.jsonl", rollup_state)
+    common.write_jsonl(run_dir / "validation_state.jsonl", validation_state)
+    _append_jsonl(run_dir / "validation_requests.jsonl",
+                  new_validation_requests)
+    _append_jsonl(run_dir / "run_warnings.jsonl", run_warnings_new)
 
-    all_findings = det_findings + semantic_findings + passnotrun_findings
+    pending_validation = [v["validation_id"] for v in validation_state
+                          if not v["done"]]
+    if pending_validation and not args.allow_pending:
+        print(f"finalize: refused - pending validation="
+              f"{len(pending_validation)} (dispatch the validation pass, "
+              f"then resolve)")
+        return 4
 
-    # ---- skeptic merge -------------------------------------------------
-    # Tolerant read for crash-safety. Valid lines are naturally idempotent
-    # (re-merging the same outcome onto the same finding_id is a no-op) and
-    # MUST be reprocessed every call -- there is no other persisted "already
-    # applied" state for them, unlike match_state's tier. Only invalid/
-    # unusable lines (malformed JSON, bad outcome/reason type, or a
-    # finding_id that doesn't match anything in this run) are fingerprinted,
-    # so a persistently-broken or persistently-unresolvable line doesn't add
-    # a duplicate validation_failures entry on every finalize call.
-    known_finding_ids = {f["finding_id"] for f in all_findings}
-    consumed_skeptic = set(consumed["skeptic"])
-    skeptic_by_finding = {}
-    skeptic_malformed = []
+    # ---- merge validation + review flags ----------------------------------
+    validation_counts = {}
+    for f in findings:
+        m = state_by_id.get(f["record_id"], _new_match_state("", ""))
+        ventry = vstate_by_id.get("VAL-" + f["finding_id"])
+        _merge_validation(f, ventry)
+        v = f["validation"]
+        validation_counts[v.get("outcome", v.get("status"))] = \
+            validation_counts.get(v.get("outcome", v.get("status")), 0) + 1
 
-    def _record_skeptic_failure(code, resp_or_raw, raw_line):
-        fp = _fingerprint(raw_line)
-        if fp in consumed_skeptic:
-            return                  # already-recorded invalid line -> no-op
-        consumed_skeptic.add(fp)
-        skeptic_malformed.append(_mk_failure(None, "skeptic", [code], resp_or_raw))
+        reasons = []
+        if f["human_review"]:
+            reasons.append("llm-human-review")
+        outcome = v.get("outcome")
+        if outcome in _VALIDATION_REVIEW_REASONS:
+            reasons.append(_VALIDATION_REVIEW_REASONS[outcome])
+        if v.get("status") == "llm-output-rejected":
+            reasons.append("validation-rejected")
+        if v.get("status") == "validation-not-run":
+            reasons.append("validation-not-run")
+        if f["claim_consistency"] == "contradicted":
+            reasons.append("claim-contradicted")
+        record = records_by_id.get(f["record_id"], {})
+        if tstate_by_index.get(
+                record.get("source_reference", {}).get("table_index"),
+                {}).get("classification") == "uncertain":
+            reasons.append("uncertain-table")
+        if m.get("scoping_incomplete"):
+            reasons.append("scoping-incomplete")
+        if f.get("comparison_split"):
+            reasons.append("comparison-split")
+        if any(w in ("llm-output-rejected", "scoping-pass-not-run",
+                     "adjudication-pass-not-run")
+               for w in m.get("warnings", [])):
+            reasons.append("record-had-rejected-output")
+        f["review_reasons"] = reasons
+        f["human_review_needed"] = bool(reasons)
 
-    for raw_line in _read_response_lines(run_dir / "skeptic_responses.jsonl"):
-        resp, parse_err = _parse_response_line(raw_line)
-        if parse_err:
-            _record_skeptic_failure(parse_err, raw_line, raw_line)
-            continue
-        fid = resp.get("finding_id") if isinstance(resp.get("finding_id"), str) \
-            else None
-        outcome = resp.get("outcome")
-        reason = resp.get("reason")
-        if (fid is None or not isinstance(outcome, str)
-                or outcome not in _SKEPTIC_OUTCOMES
-                or (reason is not None and not isinstance(reason, str))):
-            _record_skeptic_failure("malformed-response", resp, raw_line)
-            continue
-        if fid not in known_finding_ids:
-            _record_skeptic_failure("no-such-request", resp, raw_line)
-            continue
-        skeptic_by_finding[fid] = resp
-    if skeptic_malformed:
-        _append_jsonl(run_dir / "validation_failures.jsonl", skeptic_malformed)
-    consumed["skeptic"] = sorted(consumed_skeptic)
-    _save_consumed(run_dir, consumed)
+    # ---- rule rollups ------------------------------------------------------
+    findings_by_pair = {(f["record_id"], f["official_row_id"]): f
+                        for f in findings}
+    rule_rollups = []
+    rollup_warnings = []
+    for r in rollup_state:
+        base = {"rollup_id": r["rollup_id"],
+                "official_row_id": r["official_row_id"],
+                "display_id": rows_by_id.get(
+                    r["official_row_id"], {}).get("display_id"),
+                "contributing_record_ids": r["record_ids"],
+                "oversized": r.get("oversized", False)}
+        if "result" in r:
+            base.update(r["result"])
+            base["verdict"] = base.pop("joint_verdict")
+            _merge_validation(base, vstate_by_id.get("VAL-" + r["rollup_id"]))
+            reasons = []
+            if base["human_review"]:
+                reasons.append("llm-human-review")
+            outcome = base["validation"].get("outcome")
+            if outcome in _VALIDATION_REVIEW_REASONS:
+                reasons.append(_VALIDATION_REVIEW_REASONS[outcome])
+            if base["validation"].get("status") in ("llm-output-rejected",
+                                                    "validation-not-run"):
+                reasons.append("validation-" +
+                               ("rejected" if base["validation"]["status"] ==
+                                "llm-output-rejected" else "not-run"))
+            if base["oversized"]:
+                reasons.append("rollup-oversized")
+            differs = [rid for rid in r["record_ids"]
+                       if (rid, r["official_row_id"]) in findings_by_pair
+                       and findings_by_pair[(rid, r["official_row_id"])]
+                       ["verdict"] != base["verdict"]]
+            if differs:
+                reasons.append("rollup-verdict-differs")
+                rollup_warnings.append({"code": "rollup-verdict-differs",
+                                        "detail": r["official_row_id"]})
+                for rid in differs:
+                    f = findings_by_pair[(rid, r["official_row_id"])]
+                    if "rollup-verdict-differs" not in f["review_reasons"]:
+                        f["review_reasons"].append("rollup-verdict-differs")
+                        f["human_review_needed"] = True
+            base["review_reasons"] = reasons
+            base["human_review_needed"] = bool(reasons)
+        else:
+            base["status"] = "llm-output-rejected" if r.get("rejected") \
+                else "rollup-pass-not-run"
+            base["human_review_needed"] = True
+            base["review_reasons"] = [base["status"]]
+        rule_rollups.append(base)
 
-    for f in all_findings:
-        s = skeptic_by_finding.get(f["finding_id"])
-        if s is not None:
-            f["skeptic"] = {"outcome": s.get("outcome"), "reason": s.get("reason")}
-            f["disputed"] = s.get("outcome") == "refuted"
+    # ---- dedup -------------------------------------------------------------
+    kept, dropped = validate.dedup_findings(findings)
 
-    # ---- dedup + contradictions ----------------------------------------
-    kept, dropped = validate.dedup_findings(all_findings)
-    contradictions = validate.find_contradictions(kept)
-
-    # ---- coverage --------------------------------------------------------
-    ignored_ids = _ignored_row_ids(registry, company_records, doc_type)
+    # ---- coverage ----------------------------------------------------------
     coverage = coverage_mod.compute(skel["tables"], tstate_by_index,
-                                    company_records, official_rules,
-                                    match_state, ignored_ids)
+                                    company_records, official_rows,
+                                    match_state)
     if not coverage["ok"]:
         print(f"finalize: aborted - coverage not ok: {coverage['warnings']}")
         return 3
 
-    # ---- validation-failure and rule-conflict lookups for review flags --
-    all_validation_failures = (validation_failures + new_validation_failures +
-                               skeptic_malformed)
-    validation_failed_record_ids = {vf["row_id"] for vf in all_validation_failures}
-    duplicate_rule_ids = set(coverage["official"]["duplicate_coverage_rule_ids"])
-    global_conflict = bool(manifest.get("rule_conflicts"))
-    record_conflict_cache = {}
-
-    def _record_has_conflict(record_id):
-        if record_id in record_conflict_cache:
-            return record_conflict_cache[record_id]
-        record = records_by_id.get(record_id)
-        result = global_conflict
-        if record is not None and not result:
-            context = _context_for_row(record, doc_type, field="")
-            _, conflicts = rules_mod.applicable_rules(registry, context)
-            result = bool(conflicts)
-        record_conflict_cache[record_id] = result
-        return result
-
-    # ---- confidence + claim flags + human_review_needed --------------------
-    for f in kept:
-        m = state_by_id.get(f["record_id"], {"tier": None, "margin_flag": False,
-                                              "retried": False})
-        skeptic_outcome = f["skeptic"]["outcome"] if f.get("skeptic") else None
-        f["confidence"] = assign_confidence(m, f, skeptic_outcome)
-
-        record = records_by_id.get(f["record_id"], {})
-        f["company_compliance_claim"] = record.get(
-            "company_compliance_claim", "")
-        f["claim_normalized"] = record.get("claim_normalized", "unknown")
-        f["interpretation_note"] = record.get("interpretation_note", "")
-        flags = []
-        if f["claim_normalized"] == "deviation":
-            flags.append("company-declared-deviation")
-        if f["claim_normalized"] == "comply" and \
-                f.get("verdict") == "Non-Compliant":
-            flags.append("claim-contradicted")
-        f["claim_flags"] = flags
-        f["sweep_originated"] = f["rule_id"] in \
-            m.get("sweep_origin_rule_ids", [])
-
-        review = False
-        if m.get("tier") == "T3":
-            review = True
-        if not f.get("deterministic", False):
-            outcome = f["skeptic"]["outcome"] if f.get("skeptic") else None
-            if outcome != "upheld":
-                review = True
-        if f.get("rule_id") in duplicate_rule_ids:
-            review = True
-        if f.get("verdict") == "Cannot Assess" and common.fold_ws(
-                record.get("observed_value_or_evidence", "")):
-            review = True
-        if f["record_id"] in validation_failed_record_ids:
-            review = True
-        if _record_has_conflict(f["record_id"]):
-            review = True
-        if flags:
-            review = True
-        if f["sweep_originated"]:
-            review = True
-        if tstate_by_index.get(
-                record.get("source_reference", {}).get("table_index"),
-                {}).get("classification") == "uncertain":
-            review = True
-        f["human_review_needed"] = review
-
-    # ---- leftovers: unmatched / ambiguous / unaddressed -------------------
-    unmatched_rows = []
-    ambiguous = []
+    # ---- leftovers ---------------------------------------------------------
+    unmatched_rows, ambiguous, unresolved_match = [], [], []
     for m in match_state:
         record = records_by_id.get(m["record_id"])
         if record is None or record.get("status") != "ok":
             continue
-        if m["tier"] == "T3":
+        if m["decision"] == "ambiguous":
             ambiguous.append({
                 "record_id": m["record_id"],
                 "original_company_text": record.get("original_company_text", ""),
                 "source_reference": record.get("source_reference", {}),
-                "ambiguous_rule_ids": m.get("ambiguous_rule_ids", []),
-                "candidates": m.get("candidates", [])})
-        elif m["tier"] in (None, "T4"):
+                "ambiguous_official_row_ids":
+                    m.get("ambiguous_official_row_ids", []),
+                "basis": m.get("basis", "")})
+        elif m["decision"] == "none":
             unmatched_rows.append({
                 "record_id": m["record_id"],
                 "original_company_text": record.get("original_company_text", ""),
                 "source_reference": record.get("source_reference", {}),
+                "basis": m.get("basis", ""),
                 "warnings": m.get("warnings", [])})
-    matched_rule_ids_union = set().union(
-        *[m["matched_rule_ids"] for m in match_state
-         if m["tier"] in _MATCHED_TIERS] or [set()])
-    unaddressed_rules = [
-        {"rule_id": r["rule_id"], "title": r.get("title", ""),
-         "check_text": r.get("check_text", ""),
-         "expected_value": r.get("expected_value", "")}
-        for r in official_rules if r["rule_id"] not in matched_rule_ids_union]
+        elif m["decision"] == "unresolved-llm-output-rejected" or \
+                m["decision"] is None:
+            unresolved_match.append({
+                "record_id": m["record_id"],
+                "status": m["decision"] or "match-pass-not-run",
+                "original_company_text": record.get("original_company_text", ""),
+                "source_reference": record.get("source_reference", {}),
+                "warnings": m.get("warnings", [])})
 
-    # Records that never reached a comparable state at all (canonicalize
-    # rejected them outright, or an allow-pending chunk was never answered)
-    # are invisible to `unmatched_rows` (which only covers status=="ok"
-    # records) and to `findings` -- surface them explicitly for the
-    # report/audit trail.
     unresolved_rows = [
         {"record_id": r["record_id"], "status": r.get("status"),
          "notes": r.get("notes", ""),
          "source_reference": r.get("source_reference", {}),
          "original_company_text": r.get("original_company_text", "")}
         for r in company_records
-        if r["status"] == "extraction-failed"]
+        if r["status"] == "extraction-failed"] + unresolved_match
 
-    # ---- table triage -------------------------------------------------
+    unresolved_pairs = []
+    for m in match_state:
+        for u in m["comparison_units"]:
+            status = None
+            if u.get("rejected"):
+                status = "comparison-unresolved/llm-output-rejected"
+            elif u.get("not_run"):
+                status = "comparison-pass-not-run"
+            if status:
+                for oid in u["official_row_ids"]:
+                    if (m["record_id"], oid) not in \
+                            {(f["record_id"], f["official_row_id"])
+                             for f in kept}:
+                        unresolved_pairs.append(
+                            {"record_id": m["record_id"],
+                             "official_row_id": oid, "status": status})
+
+    matched_union = set()
+    for m in match_state:
+        if m["decision"] == "match":
+            matched_union.update(m["selected_official_row_ids"])
+    unaddressed_rules = [payloads.official_row_payload(r)
+                         for r in official_rows
+                         if r["official_row_id"] not in matched_union]
+
+    # ---- table triage ------------------------------------------------------
     table_triage = []
     triage_warnings = []
     for t in skel["tables"]:
@@ -1310,50 +1560,46 @@ def cmd_finalize(args):
             triage_warnings.append({"code": "mapping-failed",
                                     "detail": f"table={t['table_index']}"})
 
-    # ---- top-level warnings ----------------------------------------------
+    # ---- warnings ----------------------------------------------------------
     extract_warnings = json.loads(
         (run_dir / "extract_warnings.json").read_text(encoding="utf-8")) \
         if (run_dir / "extract_warnings.json").exists() else []
-    warnings = list(extract_warnings) + list(coverage["warnings"]) + \
-        [{"code": "rule-conflict", "rule_ids": c["rule_ids"],
-         "scope_level": c["scope_level"]} for c in manifest.get("rule_conflicts", [])] + \
-        [{"code": "duplicate-finding-dropped", "detail": fid} for fid in dropped] + \
-        [{"code": c["code"], "finding_ids": c["finding_ids"]} for c in contradictions] + \
-        triage_warnings
+    run_warnings = _read_jsonl_opt(run_dir / "run_warnings.jsonl")
+    warnings = (list(extract_warnings) + list(run_warnings) +
+                list(coverage["warnings"]) +
+                [{"code": "duplicate-finding-dropped", "detail": fid}
+                 for fid in dropped] +
+                rollup_warnings + triage_warnings)
 
     final = {
         "manifest": manifest,
         "findings": kept,
+        "rule_rollups": rule_rollups,
         "match_state": match_state,
         "coverage": coverage,
         "warnings": warnings,
         "unmatched_rows": unmatched_rows,
-        "unaddressed_rules": unaddressed_rules,
         "ambiguous": ambiguous,
         "unresolved_rows": unresolved_rows,
+        "unresolved_pairs": unresolved_pairs,
+        "unaddressed_rules": unaddressed_rules,
         "table_triage": table_triage,
     }
     (run_dir / "final.json").write_text(json.dumps(final, indent=1),
                                         encoding="utf-8")
 
-    # ---- persist post-finalize mutations (allow-pending tier/warning/table
-    # changes) --
-    # (validation_failures.jsonl / findings.jsonl / semantic_requests.jsonl /
-    # consumed fingerprints were already persisted above, before the
-    # refusal/coverage gates; re-persist match_state/table_state/
-    # company_records here to capture the allow-pending mutations: T4/
-    # matching-pass-not-run tiers, mapping-pass-not-run classifications, and
-    # canonicalize-pass-not-run failed records.)
-    common.write_jsonl(run_dir / "match_state.jsonl", match_state)
     common.write_jsonl(run_dir / "table_state.jsonl", table_state)
     common.write_jsonl(run_dir / "company_records.jsonl", company_records)
+    common.write_jsonl(run_dir / "match_state.jsonl", match_state)
 
     if not args.no_report:
         import report
         report.render(run_dir)
 
-    print(f"finalize: findings={len(kept)} dropped_dupes={len(dropped)} "
-          f"contradictions={len(contradictions)} coverage_ok={coverage['ok']} "
+    vsum = " ".join(f"{k}={v}" for k, v in sorted(validation_counts.items()))
+    print(f"finalize: findings={len(kept)} rollups={len(rule_rollups)} "
+          f"dropped_dupes={len(dropped)} coverage_ok={coverage['ok']} "
+          f"validation[{vsum}] "
           f"human_review={sum(1 for f in kept if f['human_review_needed'])}")
     return 0
 
@@ -1371,11 +1617,9 @@ def main(argv=None):
     p_start.add_argument("--company", required=True)
     p_start.add_argument("--run-dir", required=True)
 
-    p_resolve = sub.add_parser("resolve")
-    p_resolve.add_argument("--run-dir", required=True)
-
-    p_sweep = sub.add_parser("sweep")
-    p_sweep.add_argument("--run-dir", required=True)
+    for name in ("resolve", "sweep", "rollup"):
+        p = sub.add_parser(name)
+        p.add_argument("--run-dir", required=True)
 
     p_finalize = sub.add_parser("finalize")
     p_finalize.add_argument("--run-dir", required=True)
@@ -1389,6 +1633,8 @@ def main(argv=None):
         return cmd_resolve(args)
     if args.cmd == "sweep":
         return cmd_sweep(args)
+    if args.cmd == "rollup":
+        return cmd_rollup(args)
     if args.cmd == "finalize":
         return cmd_finalize(args)
     raise ValueError(f"unknown command: {args.cmd}")

@@ -1,4 +1,4 @@
-# Canonicalize Prompt (Phase 2: row canonicalization)
+# Row Interpretation Prompt (Phase 2: additive row annotation)
 
 STRICT RULES — apply to every response:
 - Use ONLY the evidence supplied in the request. No outside knowledge.
@@ -9,16 +9,19 @@ STRICT RULES — apply to every response:
   Quotes are checked mechanically; an altered quote invalidates the response.
 - Distinguish observation (what the texts say) from interpretation
   (what you conclude). Put conclusions only in the fields meant for them.
+- When the request carries `retry: true`, echo `"retry": true` in your
+  response — a response missing a required echo is rejected mechanically.
 - Output MUST be a single JSON object matching the schema below exactly.
 
 ## Input
 
-One record from `canonicalize_requests.jsonl`:
+One record from `interpretation_requests.jsonl`:
 
 - `chunk_id` (string) — echo back unchanged.
-- `table_index` (int), `context_grouping` (string), `header_row` (array).
-- `column_mapping` (object) — the approved Phase-1 mapping: column index
-  (string) -> canonical field | "extra_field" | "ignore".
+- `table_index` (int), `context_grouping` (string), `header_row` (array),
+  `preceding_narrative` (string).
+- `column_mapping` (object) — the approved Phase-1 annotation: column index
+  (string) -> canonical field | "other". A hint, not a gate.
 - `rows` (array) — this chunk's rows: `{"row_index": int, "cells": [...],
   "merged": bool}`.
 - On a retry: `retry: true` and `previous_errors`.
@@ -35,6 +38,7 @@ One record from `canonicalize_requests.jsonl`:
         "fields": {"stig_objective_or_requirement": "..."},
         "field_provenance": {"stig_objective_or_requirement":
                               {"row_index": 1, "cell_index": 0}},
+        "company_claim_reading": "comply | deviation | unclear | none",
         "interpretation_note": ""}]},
     {"row_index": 2, "disposition": "separator", "separator_text": "..."}
   ]
@@ -43,6 +47,11 @@ One record from `canonicalize_requests.jsonl`:
 
 ## Decision guide
 
+- Everything you extract here is an ADDITIVE aid: the complete verbatim row
+  (all cells, continuation cells, headers, narrative) travels to matching,
+  comparison, and validation regardless of what you put in `fields`. A
+  sparse `fields` object is a normal answer — extract only what is clearly
+  present.
 - Account for EVERY row in the request's `rows`, exactly once, using
   `disposition`:
   - `"record"` — a data row. Produce 1..n records (see splitting below).
@@ -56,9 +65,8 @@ One record from `canonicalize_requests.jsonl`:
   A missing or duplicated `row_index` invalidates the whole response.
 - Default behavior for a `record` row: for each column mapped to a
   canonical field, copy that cell's text VERBATIM into `fields` and record
-  `{"row_index", "cell_index"}` in `field_provenance`. Skip empty cells.
-  Do not copy `extra_field` or `ignore` columns into `fields` — the
-  pipeline preserves extra-field cells itself.
+  `{"row_index", "cell_index"}` in `field_provenance`. Skip empty cells
+  and `other` columns (their cells still travel with the full row).
 - Deviate from the column mapping ONLY when the row itself demands it
   (e.g. a value sitting in the wrong column) — provenance must still point
   at the actual cell the text came from, and the text must remain
@@ -67,6 +75,13 @@ One record from `canonicalize_requests.jsonl`:
   emit several records with `sub_index` 0, 1, ... — each field value still
   a verbatim substring of a single cell of this row (or its continuation
   rows).
+- `company_claim_reading`: what THIS row's own text states about the
+  company's compliance stance. `comply` when the row states the company
+  complies/adopts the requirement; `deviation` when it declares a
+  deviation or non-adoption; `unclear` when the row addresses its stance
+  but you cannot tell which; `none` when the row states no stance at all.
+  NEVER infer a stance the row does not state — silence is `none`, not
+  `comply`.
 - `interpretation_note` is the ONLY free-text field: use it to note what a
   human reviewer should know (e.g. "the DEVIATION entry appears to apply
   only to the second setting"). It is display-only and never used as
